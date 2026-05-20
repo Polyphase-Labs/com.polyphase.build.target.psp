@@ -1,0 +1,243 @@
+# Makefile_PSP — Polyphase PSP build, Phase 1 (engine compiles + boots).
+#
+# Single-pass build: compiles the engine source tree + PSP addon runtime +
+# the project's own source into one .elf (no Engine.a intermediate). Mirrors
+# the 3DS Makefile layout but adapted for psp-gcc + PSPSDK + sceGu.
+#
+# Run via the editor's PSP build-target addon (which invokes this from inside
+# WSL on Windows hosts), OR manually:
+#
+#   make -C <projectDir> -f Makefile_PSP -j
+#
+# Requires PSPSDK installed and `$PSPDEV/bin` on PATH inside the shell that
+# invokes make. The addon's GetCompileCommand emits a `wsl bash -lc` wrapper
+# on Windows hosts and a native `bash -lc` wrapper on POSIX.
+
+# If a compile recipe fails or is interrupted (Ctrl-C, OOM-kill, WSL pipe
+# break from the editor's SYS_ExecFull, parallel-job cancel under -j), GNU
+# make would otherwise leave a 0-byte .o on disk. That stub then satisfies
+# the next build's freshness check, so make skips the compile and the link
+# silently succeeds — but the .o defines no symbols, producing baffling
+# "undefined reference to ..." errors that look like missing libs. Deleting
+# partial outputs on failure prevents the whole class of bug for this and
+# every future Makefile-based build target.
+.DELETE_ON_ERROR:
+
+TARGET   = $(notdir $(CURDIR))
+
+# ---- Engine + addon paths ---------------------------------------------------
+# POLYPHASE_PATH resolution:
+#   1. Set on the make command line by the PSP addon's GetCompileCommand —
+#      this is the normal path. The addon already knows where the engine
+#      lives (ctx->engineDir) and passes it explicitly so the walk-up
+#      heuristic never has to guess.
+#   2. Set in the environment.
+#   3. Walk-up from $(CURDIR) looking for Polyphase.sln. Only works when
+#      the project dir is a direct descendant of the engine repo.
+#   4. /opt/Polyphase as a last-resort default.
+POLYPHASE_PATH ?= $(shell \
+    p=$(CURDIR); \
+    for i in 1 2 3 4 5 6; do \
+        p=$$(dirname $$p); \
+        if [ -f $$p/Polyphase.sln ]; then echo $$p; exit 0; fi; \
+    done; \
+    echo /opt/Polyphase )
+
+# Fail loudly if POLYPHASE_PATH doesn't resolve to a real engine. Without
+# this guard the link silently produces an .elf with only crt0.o because all
+# -I and source-dir paths point at /opt/Polyphase/Engine/* which doesn't
+# exist, and make happily compiles zero TUs.
+ifeq ($(wildcard $(POLYPHASE_PATH)/Engine/Source/Engine/Engine.h),)
+$(error POLYPHASE_PATH='$(POLYPHASE_PATH)' does not contain Engine/Source/Engine/Engine.h. \
+  Pass POLYPHASE_PATH=/path/to/polyphase-engine on the make command line (the editor's PSP \
+  addon does this automatically; if you're invoking make manually, set it yourself). \
+  Inside WSL, Windows-side paths look like /mnt/<drive>/path/to/engine.)
+endif
+
+ADDON_PSP_RUNTIME = Packages/com.polyphase.build.target.psp/Runtime/PSP
+
+# ---- Source discovery -------------------------------------------------------
+# PSPSDK's build.mak does its own wildcard expansion against SOURCES, picking
+# every .c / .cpp / .S under each listed directory. Adding a new source file
+# to one of these dirs is a no-op for this makefile — make rebuilds the right
+# objects automatically.
+#
+# We DO NOT include Source/System/Windows, Source/Audio/Linux, etc. — those
+# are hard-guarded by #if PLATFORM_* at the file level and would only emit
+# zero code anyway, but excluding them speeds up compile and avoids spurious
+# warnings.
+SOURCES = \
+    $(POLYPHASE_PATH)/Engine/Source/Engine \
+    $(POLYPHASE_PATH)/Engine/Source/Engine/Assets \
+    $(POLYPHASE_PATH)/Engine/Source/Engine/Animation \
+    $(POLYPHASE_PATH)/Engine/Source/Engine/Nodes \
+    $(POLYPHASE_PATH)/Engine/Source/Engine/Nodes/3D \
+    $(POLYPHASE_PATH)/Engine/Source/Engine/Nodes/Widgets \
+    $(POLYPHASE_PATH)/Engine/Source/Engine/NodeGraph \
+    $(POLYPHASE_PATH)/Engine/Source/Engine/NodeGraph/Nodes \
+    $(POLYPHASE_PATH)/Engine/Source/Engine/NodeGraph/Domains \
+    $(POLYPHASE_PATH)/Engine/Source/Engine/UI \
+    $(POLYPHASE_PATH)/Engine/Source/Engine/Timeline \
+    $(POLYPHASE_PATH)/Engine/Source/Engine/Timeline/Tracks \
+    $(POLYPHASE_PATH)/Engine/Source/Plugins \
+    $(POLYPHASE_PATH)/Engine/Source/System \
+    $(POLYPHASE_PATH)/Engine/Source/Graphics \
+    $(POLYPHASE_PATH)/Engine/Source/Input \
+    $(POLYPHASE_PATH)/Engine/Source/Audio \
+    $(POLYPHASE_PATH)/Engine/Source/Network \
+    $(POLYPHASE_PATH)/Engine/Source/Network/Http \
+    $(POLYPHASE_PATH)/Engine/Source/Network/Http/Backends \
+    $(POLYPHASE_PATH)/Engine/Source/Serial/Stub \
+    $(POLYPHASE_PATH)/Engine/Source/LuaBindings \
+    $(POLYPHASE_PATH)/External/Lua \
+    $(POLYPHASE_PATH)/External/Vorbis \
+    $(POLYPHASE_PATH)/External/IrrXML \
+    $(POLYPHASE_PATH)/External/Bullet/BulletCollision/BroadphaseCollision \
+    $(POLYPHASE_PATH)/External/Bullet/BulletCollision/CollisionDispatch \
+    $(POLYPHASE_PATH)/External/Bullet/BulletCollision/CollisionShapes \
+    $(POLYPHASE_PATH)/External/Bullet/BulletCollision/Gimpact \
+    $(POLYPHASE_PATH)/External/Bullet/BulletCollision/NarrowPhaseCollision \
+    $(POLYPHASE_PATH)/External/Bullet/BulletDynamics/Character \
+    $(POLYPHASE_PATH)/External/Bullet/BulletDynamics/ConstraintSolver \
+    $(POLYPHASE_PATH)/External/Bullet/BulletDynamics/Dynamics \
+    $(POLYPHASE_PATH)/External/Bullet/BulletDynamics/Featherstone \
+    $(POLYPHASE_PATH)/External/Bullet/BulletDynamics/MLCPSolvers \
+    $(POLYPHASE_PATH)/External/Bullet/BulletDynamics/Vehicle \
+    $(POLYPHASE_PATH)/External/Bullet/LinearMath \
+    $(POLYPHASE_PATH)/External/recastnavigation/Recast/Source \
+    $(POLYPHASE_PATH)/External/recastnavigation/Detour/Source \
+    $(ADDON_PSP_RUNTIME) \
+    $(ADDON_PSP_RUNTIME)/Graphics_PSPGU \
+    Source
+
+# ---- Include path -----------------------------------------------------------
+INCDIR = \
+    Generated \
+    $(ADDON_PSP_RUNTIME) \
+    $(ADDON_PSP_RUNTIME)/Graphics_PSPGU \
+    $(POLYPHASE_PATH)/Engine/Source \
+    $(POLYPHASE_PATH)/Engine/Source/Engine \
+    $(POLYPHASE_PATH)/External \
+    $(POLYPHASE_PATH)/External/Bullet \
+    $(POLYPHASE_PATH)/External/Lua \
+    $(POLYPHASE_PATH)/External/glm \
+    $(POLYPHASE_PATH)/External/Vorbis \
+    $(POLYPHASE_PATH)/External/Assimp/contrib/rapidjson \
+    $(POLYPHASE_PATH)/External/recastnavigation/Recast/Include \
+    $(POLYPHASE_PATH)/External/recastnavigation/Detour/Include \
+    $(POLYPHASE_PATH)/Engine/External/PolyVox/include
+
+# ---- Object list ------------------------------------------------------------
+# PSPSDK's build.mak consumes an explicit OBJS list — unlike devkitPro's
+# 3ds_rules it does NOT auto-wildcard SOURCES. We do the expansion here:
+# every *.cpp / *.c under each SOURCES dir becomes a flat-basename .o
+# placed in CWD, with VPATH telling make where to find the original source.
+#
+# Caveat: two source files with the same basename in different SOURCES dirs
+# will collide on output. The Polyphase engine doesn't currently have such
+# collisions (the subsystem-level files use distinct names like Audio.cpp,
+# Input.cpp, etc.) — if one appears the fix is to disambiguate by giving
+# OBJS a per-dir prefix.
+CPPFILES := $(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.cpp)))
+CFILES   := $(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.c)))
+
+VPATH := $(SOURCES)
+OBJS  := $(CPPFILES:.cpp=.o) $(CFILES:.c=.o)
+
+# ---- Flags ------------------------------------------------------------------
+# Variant 2 platform-extension flag plus PSP-native macros. PLATFORM_PSP and
+# API_PSPGU are defined so future engine inline arms can target PSP precisely;
+# the addon-arm in fork headers (POLYPHASE_PLATFORM_ADDON) takes precedence
+# anyway by being first in every chain.
+DEFINES = \
+    -DPOLYPHASE_PLATFORM_ADDON=1 \
+    -DPLATFORM_PSP=1 \
+    -DAPI_PSPGU=1 \
+    -DEDITOR=0 \
+    -DLUA_ENABLED=1 \
+    -DGLM_FORCE_RADIANS \
+    -DLOGGING_ENABLED=1
+
+CFLAGS   = -O2 -G0 -Wall -Wno-unused-parameter -Wno-unused-variable $(DEFINES)
+CXXFLAGS = $(CFLAGS) -fno-exceptions -fno-rtti -std=c++17
+ASFLAGS  = $(CFLAGS)
+
+# ---- Libraries --------------------------------------------------------------
+# PSPSDK ships everything the engine needs except Lua (we compile our own
+# from $(POLYPHASE_PATH)/External/Lua) and Vorbis (same — engine sources
+# already include the .c files via SOURCES).
+#
+# We only add libraries that PSPSDK's build.mak DOESN'T add automatically.
+# build.mak appends `-lc -lpspuser -lpsputility -lpspkernel -lpspnet
+# -lpspnet_apctl -lpsphprm -lpspdebug -lpspdisplay -lpspctrl -lpspge` etc.
+# in the correct order; duplicating them in LIBS scrambles the link order
+# and triggers psp-fixup-imports' "stubs out of order" warning.
+LIBDIR =
+# `--allow-multiple-definition` is needed because newlib's libc.a and PSPSDK's
+# libpspkernel.a both export `strtol` / `strtoul`. The pspkernel versions are
+# syscall thunks and the newlib ones are full implementations; either works,
+# letting the first-seen one win is the standard PSP homebrew workaround.
+LDFLAGS = -Wl,--allow-multiple-definition
+LIBS = \
+    -lpspgum_vfpu -lpspvfpu -lpspgu \
+    -lpspaudio -lpspaudiocodec \
+    -lpsppower \
+    -lpsprtc -lpspsdk \
+    -lm -lstdc++
+
+# ---- PSPSDK boilerplate -----------------------------------------------------
+# PSPDEV resolution. We deliberately DON'T call `psp-config --pspsdk-path` here
+# because `bash -lc` from the editor's WSL dispatch often doesn't source
+# ~/.bashrc (Ubuntu's stock .bashrc early-returns for non-interactive shells),
+# so PSPDEV / PATH exports added there are invisible to this make invocation.
+#
+# Resolution order:
+#   1. PSPDEV set on the make command line (`make ... PSPDEV=/path`).
+#   2. PSPDEV exported in the environment.
+#   3. Auto-detect at common install locations — the first directory that has
+#      a `psp/sdk/lib/build.mak` wins. Covers /usr/local/pspdev (official
+#      tarball), /opt/pspdev, $HOME/pspdev, and /mnt/c/pspdev (the canonical
+#      spot when pspdev was installed Windows-side and is consumed through
+#      WSL's /mnt drvfs mount).
+ifeq ($(strip $(PSPDEV)),)
+PSPDEV_CANDIDATES := /usr/local/pspdev /opt/pspdev $(HOME)/pspdev /mnt/c/pspdev /mnt/d/pspdev
+PSPDEV := $(firstword $(foreach d,$(PSPDEV_CANDIDATES),$(if $(wildcard $(d)/psp/sdk/lib/build.mak),$(d))))
+ifeq ($(strip $(PSPDEV)),)
+PSPDEV := /usr/local/pspdev
+endif
+endif
+
+# psp-config --pspsdk-path conventionally returns $(PSPDEV)/psp/sdk.
+PSPSDK ?= $(PSPDEV)/psp/sdk
+
+# Export PATH so build.mak's recursive psp-gcc / psp-ld / mksfoex / pack-pbp
+# invocations find the toolchain even when the parent shell didn't set it.
+export PATH := $(PSPDEV)/bin:$(PATH)
+
+# Fail loudly with a copy-pasteable install hint if PSPSDK isn't reachable.
+# Without this guard the error would just be "include not found" with no
+# obvious next step.
+ifeq ($(wildcard $(PSPSDK)/lib/build.mak),)
+$(error PSPSDK not found at '$(PSPSDK)/lib/build.mak'. Install pspdev inside WSL: \
+  cd /tmp && \
+  curl -L -o pspdev.tar.gz https://github.com/pspdev/pspdev/releases/download/latest/pspdev-ubuntu-latest-x86_64.tar.gz && \
+  sudo tar -xzf pspdev.tar.gz -C /usr/local/ && \
+  export PSPDEV=/usr/local/pspdev. \
+  Or set PSPDEV=/path/to/your/install when invoking make.)
+endif
+
+include $(PSPSDK)/lib/build.mak
+
+# ---- Stage final ELF for the addon's GetCompiledBinaryPath ------------------
+# The addon's GetCompiledBinaryPath returns <projectDir>/Build/PSP/<name>.elf.
+# build.mak produces $(TARGET).elf in the current directory; we copy it to the
+# expected location so the rest of the build-target pipeline (binary mtime
+# check, copy-to-Packaged, pack-pbp wrap) finds it.
+all: stage
+stage: $(TARGET).elf
+	@mkdir -p Build/PSP
+	@cp $(TARGET).elf Build/PSP/$(TARGET).elf
+	@echo "Staged Build/PSP/$(TARGET).elf"
+
+cleanstage:
+	@rm -rf Build/PSP

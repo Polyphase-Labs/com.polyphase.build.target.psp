@@ -176,9 +176,32 @@ The Build Profile UI for the PSP target exposes:
 - **Disc ID** — 9-char `PARAM.SFO` ID (default `POLY00001`)
 - **Firmware** — minimum PSP firmware version (default `6.60`)
 - **Custom Makefile** — override `Makefile_PSP` path if you have a fork
+- **Parallel Jobs** — `make -j<N>` (default **4**). See "Host RAM and parallel jobs" below.
 - **ICON0.PNG** / **PIC1.PNG** — XMB icon (144×80) and background (480×272)
 - **WSL Distribution** (Windows only) — defaults to `Ubuntu`
 - **PSPDEV path** — overrides auto-detect
+
+## Host RAM and parallel jobs
+
+Engine translation units are heavy under `psp-gcc`. Engine.cpp, Renderer.cpp,
+Bullet, Vorbis, and a handful of others each **peak at 1–2 GB of RAM** during
+their compile. Naive `make -j` (no limit) spawns one job per CPU core, so on a
+modern 12-core box you get 12 × ~1.5 GB = 18 GB committed before the OS, IDE,
+or shell get a turn. On a 16 GB host this **freezes the machine** within
+seconds (swap death; not a hang you can recover from quickly).
+
+The addon defaults `-j4`. Rule of thumb:
+
+| Host RAM | Safe jobs | Notes |
+| --- | --- | --- |
+| 8 GB | 2 | Tight. Close other apps before building. |
+| 16 GB | **4** (default) | Headroom for IDE / browser. |
+| 32 GB | 8–12 | Most workstations. |
+| 64 GB | 16+ | Beefy desktop / CI runner. |
+
+Tune via the **Parallel Jobs** slider in the Build Profile. The value is
+clamped to `[1, 64]` server-side and silently falls back to `4` if you somehow
+inject garbage.
 
 ## Known quirks (from Phase 2 development)
 
@@ -204,6 +227,7 @@ notes; summarising the important ones:
 | Path | Purpose |
 | --- | --- |
 | `Source/ComPolyphaseBuildTargetPsp.cpp` | The editor-side addon DLL: build target descriptor + `GetCompileCommand` + `PostPackage` + `RunInEmulator` callbacks |
+| `Makefile_PSP` | PSPSDK build wrapper — invoked by the addon's `GetCompileCommand` via `make -f <addonRoot>/Makefile_PSP -C <projectDir>`. Lives inside the addon so projects don't have to ship their own. Override with the **Custom Makefile** profile option to point at a fork. |
 | `Runtime/PSP/Main_PSP.cpp` | PSP entry point (`PSP_MODULE_INFO`, exit callback, calls `GameMain`) |
 | `Runtime/PSP/System_PSP.cpp` | `SYS_*` implementations |
 | `Runtime/PSP/Graphics_PSPGU/Graphics_PSPGU.cpp` | `GFX_*` implementations |

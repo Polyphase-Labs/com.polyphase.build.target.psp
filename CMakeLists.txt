@@ -54,7 +54,7 @@ if(NOT DEFINED POLYPHASE_PATH OR POLYPHASE_PATH STREQUAL "")
         elseif(UNIX AND EXISTS "/opt/Polyphase/PolyphaseEditor")
             set(POLYPHASE_PATH "/opt/Polyphase")
         else()
-            set(POLYPHASE_PATH "M:/Projects/Polyphase/Polyphase/CODE/mergePolyphase/polyphase-engine/")
+            set(POLYPHASE_PATH "/home/uai/Projects/PolyphaseEngine/Engine/Code/Polyphase-Engine/")
         endif()
     endif()
 endif()
@@ -104,9 +104,8 @@ target_compile_definitions(com.polyphase.build.target.psp PRIVATE
     EDITOR=1
     LUA_ENABLED=1
     GLM_FORCE_RADIANS
-    PLATFORM_WINDOWS=1
+    PLATFORM_LINUX=1
     API_VULKAN=1
-    NOMINMAX
     COMPOLYPHASEBUILDTARGETPSP_EXPORTS
 )
 

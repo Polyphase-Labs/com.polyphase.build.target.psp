@@ -28,10 +28,11 @@
  *       (PSP_EMULATOR env var overrides the executable name).
  *
  * Project expectations:
- *   - Each Polyphase project that targets PSP ships a `Makefile_PSP` next to
- *     its scenes; the makefile is expected to use PSPSDK's standard
- *     `$(PSPSDK)/lib/build.mak` template so `make` produces an .elf the
- *     engine can locate under `Build/PSP/<projectName>.elf`.
+ *   - The PSP build's makefile (`Makefile_PSP`) ships INSIDE this addon, at
+ *     `Packages/com.polyphase.build.target.psp/Makefile_PSP`. Projects don't
+ *     have to add anything themselves; the addon's GetCompileCommand passes
+ *     the addon-relative path to `make -f`. Users can override via the
+ *     "Custom Makefile" build-profile option.
  *   - The icon / preview images for the XMB live under <projectDir>/PSP/ as
  *     ICON0.PNG, PIC1.PNG, etc. (per the standard PSP SFO layout). All are
  *     optional — pack-pbp accepts empty slots.
@@ -81,16 +82,24 @@ namespace
 
     constexpr const char* kTitleKey         = "psp.title";          // shown on XMB
     constexpr const char* kDiscIdKey        = "psp.discId";         // 9-char ID e.g. "POLY00001"
-    constexpr const char* kMakefileKey      = "psp.makefile";       // makefile name in project root
+    constexpr const char* kMakefileKey      = "psp.makefile";       // bare filename inside addon root, or absolute override
     constexpr const char* kIconPngKey       = "psp.icon0";          // 144x80 ICON0.PNG (relative to projectDir)
     constexpr const char* kBgPngKey         = "psp.pic1";           // 480x272 PIC1.PNG  (relative to projectDir)
     constexpr const char* kFirmwareKey      = "psp.firmware";       // e.g. "1.00", "5.00" (PSP_FW_VERSION)
     constexpr const char* kWslDistroKey     = "psp.wslDistro";      // Windows only — override default WSL distro
     constexpr const char* kPspDevPathKey    = "psp.pspdevPath";     // Path to pspdev install inside the build shell
+    constexpr const char* kJobsKey          = "psp.jobs";           // make -j parallelism (default 4; engine TUs are 1-2 GB/TU peak)
 
     constexpr const char* kTitleDefault     = "Polyphase Game";
     constexpr const char* kDiscIdDefault    = "POLY00001";
     constexpr const char* kMakefileDefault  = "Makefile_PSP";
+
+    // Engine TUs are heavy — Engine.cpp, Renderer.cpp, Bullet, Vorbis etc.
+    // each peak at 1-2 GB of psp-gcc RAM. Plain `make -j` means unlimited
+    // parallelism, which OOM-freezes 16 GB hosts within seconds. Capping at
+    // 4 jobs gives ~6-8 GB peak — safe baseline. Users with 32+ GB hosts
+    // can bump this via the "Jobs" build-profile option.
+    constexpr const char* kJobsDefault      = "4";
     constexpr const char* kFirmwareDefault  = "5.50";
     // No default for PSPDEV path — we leave it empty so the makefile's own
     // fallback ladder kicks in (/usr/local/pspdev). Users with non-standard
@@ -253,8 +262,33 @@ namespace
     {
         if (ctx == nullptr || ctx->projectDir == nullptr) return 0;
 
-        const std::string makefile  = ReadOption(ctx, kMakefileKey,    kMakefileDefault);
-        const std::string pspdevPath = ReadOption(ctx, kPspDevPathKey, "");
+        const std::string makefileOpt = ReadOption(ctx, kMakefileKey,    kMakefileDefault);
+        const std::string pspdevPath  = ReadOption(ctx, kPspDevPathKey, "");
+        const std::string jobsOpt     = ReadOption(ctx, kJobsKey,       kJobsDefault);
+
+        // Validate jobs option — must be a positive decimal int. Reject
+        // anything else (silently falls back to default) so we never emit
+        // `make -j abc` or `make -j-99` to the shell.
+        int jobs = 0;
+        for (char c : jobsOpt) { if (c < '0' || c > '9') { jobs = 0; break; } jobs = jobs * 10 + (c - '0'); }
+        if (jobs < 1 || jobs > 64) jobs = 4;
+
+        // Resolve the makefile path. Makefile_PSP ships inside the addon —
+        // bare filenames (the default) live under
+        // <projectDir>/Packages/com.polyphase.build.target.psp/. Absolute
+        // overrides (starting with '/' or a Windows drive letter) are taken
+        // as-is so users can point at a fork. The `-C` flag below still puts
+        // make's working dir at projectDir, so all relative paths inside the
+        // makefile (Generated/, Source/, Build/PSP/, etc.) resolve against
+        // the project as before.
+        const bool isAbsolute =
+            !makefileOpt.empty() &&
+            (makefileOpt[0] == '/' ||
+             (makefileOpt.size() >= 2 && makefileOpt[1] == ':'));
+        const std::string makefilePath = isAbsolute
+            ? makefileOpt
+            : (std::string(ctx->projectDir) +
+               "/Packages/com.polyphase.build.target.psp/" + makefileOpt);
 
         // Pass PSPDEV directly to make so the Makefile doesn't have to depend
         // on the shell having sourced ~/.bashrc (Ubuntu's stock .bashrc
@@ -286,10 +320,13 @@ namespace
             makePolyphasePath = " POLYPHASE_PATH=" + ShellPath(ctx->engineDir);
         }
 
+        char jobsArg[16];
+        std::snprintf(jobsArg, sizeof(jobsArg), " -j%d", jobs);
+
         const std::string body =
             "make -C " + ShellPath(ctx->projectDir) +
-            " -f '" + makefile + "'" +
-            makePspDev + makePolyphasePath + " -j";
+            " -f " + ShellPath(makefilePath) +
+            makePspDev + makePolyphasePath + jobsArg;
 
         std::snprintf(outCmd, cap, "%s", WrapShell(ctx, body).c_str());
         return 1;
@@ -537,7 +574,27 @@ namespace
                 ctx->SetProfileSetting(kMakefileKey, buf);
             }
             if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Project-relative makefile that wraps PSPSDK's build.mak (default: Makefile_PSP).");
+                ImGui::SetTooltip("Makefile that wraps PSPSDK's build.mak. Bare filename resolves inside the addon (default: Makefile_PSP). Absolute paths point at a fork.");
+        }
+
+        // ----- make -j parallelism ----------------------------------------
+        // Each engine TU peaks at 1-2 GB during psp-gcc compile. Plain `-j`
+        // (unlimited) freezes 16 GB hosts. Default 4 ≈ 6-8 GB peak, safe on
+        // most laptops. Bump to nproc on workstations with 32+ GB.
+        {
+            std::string current = ReadOption(ctx, kJobsKey, kJobsDefault);
+            int jobs = std::atoi(current.c_str());
+            if (jobs < 1 || jobs > 64) jobs = 4;
+            if (ImGui::SliderInt("Parallel Jobs", &jobs, 1, 32))
+            {
+                char buf[8];
+                std::snprintf(buf, sizeof(buf), "%d", jobs);
+                ctx->SetProfileSetting(kJobsKey, buf);
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("`make -j<N>` parallelism. Each compile job peaks at 1-2 GB RAM.\n"
+                                  "Rule of thumb: jobs = min(CPU cores, host RAM GB / 2).\n"
+                                  "16 GB host → 4-6 jobs. 32 GB → 8-12. Default 4.");
         }
 
         // ----- WSL distro override (Windows-only host concept, but harmless
