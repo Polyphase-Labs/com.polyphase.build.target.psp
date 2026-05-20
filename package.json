@@ -1,0 +1,22 @@
+{
+    "name": "com.polyphase.build.target.psp",
+    "author": "Justin Jaro",
+    "description": "Adds a 'Sony PSP (PSPSDK)' build target to the Polyphase editor. Compiles via PSPSDK (mips-allegrex-gcc), wraps the ELF + PARAM.SFO + ICON0/PIC1 into an EBOOT.PBP via pack-pbp, launches in PPSSPP or deploys to real hardware via pspsh. On Linux/macOS the toolchain runs natively against $PSPDEV; on Windows it runs inside WSL2 (pspdev publishes no native Windows binaries) — install WSL2 + Ubuntu, then install pspdev inside WSL.",
+    "version": "1.0.0",
+    "native": {
+        "target": "editor",
+        "sourceDir": "Source",
+        "binaryName": "com.polyphase.build.target.psp",
+        "entrySymbol": "PolyphasePlugin_GetDesc",
+        "apiVersion": 4,
+        "resolveMode": "source",
+        "buildTargets": [
+            {
+                "id": "homebrew.psp",
+                "displayName": "Sony PSP (PSPSDK)",
+                "category": "Handheld"
+            }
+        ],
+        "binaries": []
+    }
+}

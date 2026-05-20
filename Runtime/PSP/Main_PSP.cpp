@@ -1,0 +1,165 @@
+/**
+ * @file Main_PSP.cpp
+ * @brief PSP entry point — boots the engine, runs the main loop, exits clean.
+ *
+ * Mirrors the desktop Standalone/Source/Main.cpp boot sequence (Oct* hooks
+ * → GameMain) but uses PSPSDK entry conventions:
+ *
+ *   - PSP_MODULE_INFO + PSP_MAIN_THREAD_ATTR populate the .sceModuleInfo
+ *     section the PSP loader reads from EBOOT.PBP.
+ *   - SetupCallbacks() spawns a small thread that registers an exit callback
+ *     so the user can press Home → Yes to return to the XMB cleanly.
+ *   - GameMain() (defined inside Engine.cpp) does the actual engine boot,
+ *     update loop, shutdown. We just call it.
+ *
+ * The engine's `int main` is gated out when POLYPHASE_PLATFORM_ADDON is
+ * defined (small arm in Engine.cpp), so our main below is the sole entry.
+ *
+ * Oct* hooks below are stubs — the BuildTarget-DevEnv project doesn't have
+ * its own Main.cpp to provide them, so we supply minimal versions here.
+ * Real game projects targeting PSP can override by defining their own
+ * Main_PSP.cpp under Source/ (the addon doesn't need a copy then).
+ */
+
+#if defined(POLYPHASE_PLATFORM_ADDON)
+
+#include <pspkernel.h>
+#include <pspdebug.h>
+#include <pspthreadman.h>
+#include <pspctrl.h>
+#include <pspiofilemgr.h>
+
+#include <stdio.h>
+#include <string.h>
+
+#include "Engine.h"
+
+// Boot-checkpoint log appender. Independent of the engine's SYS_Log so it
+// works BEFORE Initialize() runs — if the engine crashes early during init,
+// the last checkpoint written tells us exactly where. Writes to the same
+// file SYS_Log uses so everything ends up in one place.
+//
+// Path: ms0:/PSP/GAME/POLYPHASE/polyphase.log
+//   On PPSSPP that's <user>/Documents/PPSSPP/memstick/PSP/GAME/POLYPHASE/polyphase.log
+//   On real PSP hardware that's a real path on the memory stick.
+// PPSSPP launches the EBOOT.PBP directly from the project's Packaged/ dir
+// without ever installing to ms0:/PSP/GAME/, so the parent directory tree
+// doesn't exist on first boot. sceIoMkdir is single-level only — chain it.
+// EEXIST returns < 0 but is harmless; the open below works either way.
+static void Psp_EnsureBootLogDir()
+{
+    sceIoMkdir("ms0:/PSP", 0777);
+    sceIoMkdir("ms0:/PSP/GAME", 0777);
+    sceIoMkdir("ms0:/PSP/GAME/POLYPHASE", 0777);
+}
+
+static void Psp_BootLog(const char* msg)
+{
+    if (msg == nullptr) return;
+    fputs(msg, stdout); fputc('\n', stdout); fflush(stdout);
+    Psp_EnsureBootLogDir();
+    const SceUID fd = sceIoOpen("ms0:/PSP/GAME/POLYPHASE/polyphase.log",
+                                PSP_O_WRONLY | PSP_O_CREAT | PSP_O_APPEND, 0777);
+    if (fd < 0) return;
+    sceIoWrite(fd, msg, strlen(msg));
+    sceIoWrite(fd, "\n", 1);
+    sceIoClose(fd);
+}
+
+static void Psp_TruncateBootLog()
+{
+    // Open with TRUNC to clear any prior session's contents — keeps the log
+    // bounded and means each run starts fresh.
+    Psp_EnsureBootLogDir();
+    const SceUID fd = sceIoOpen("ms0:/PSP/GAME/POLYPHASE/polyphase.log",
+                                PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
+    if (fd >= 0)
+    {
+        const char* hdr = "=== Polyphase PSP boot log ===\n";
+        sceIoWrite(fd, hdr, strlen(hdr));
+        sceIoClose(fd);
+    }
+}
+
+PSP_MODULE_INFO("Polyphase", 0, 1, 0);
+PSP_MAIN_THREAD_ATTR(THREAD_ATTR_USER);
+// Stack size for the PSP main thread. 256 KB matches what most homebrew
+// engines pick — Polyphase's reflection + scene-graph tables push past the
+// default 16 KB.
+PSP_MAIN_THREAD_STACK_SIZE_KB(256);
+
+// -------------------------------------------------------------------------
+// Oct* hooks — minimal stubs. Engine/Source/Engine/OctHookAutoRegister.cpp
+// resolves these externs at static-init time and forwards them through
+// RegisterOctHooks(), so the engine sees them as the game's hooks.
+// -------------------------------------------------------------------------
+
+void OctPreInitialize(EngineConfig& config)
+{
+    GetEngineState()->mStandalone = true;
+    if (config.mWindowWidth == 0)  config.mWindowWidth  = 480;
+    if (config.mWindowHeight == 0) config.mWindowHeight = 272;
+}
+
+void OctPostInitialize() {}
+void OctPreUpdate() {}
+void OctPostUpdate() {}
+void OctPreShutdown() {}
+void OctPostShutdown() {}
+
+// -------------------------------------------------------------------------
+// PSP exit-callback wiring. Without this, the Home button doesn't cleanly
+// return to the XMB — the game just freezes.
+// -------------------------------------------------------------------------
+
+static int ExitCallback(int /*arg1*/, int /*arg2*/, void* /*common*/)
+{
+    sceKernelExitGame();
+    return 0;
+}
+
+static int CallbackThread(SceSize /*args*/, void* /*argp*/)
+{
+    const int cb = sceKernelCreateCallback("exit_cb", &ExitCallback, nullptr);
+    sceKernelRegisterExitCallback(cb);
+    sceKernelSleepThreadCB();
+    return 0;
+}
+
+static int SetupCallbacks()
+{
+    const int th = sceKernelCreateThread("update_thread", &CallbackThread,
+                                         0x11, 0xFA0, 0, nullptr);
+    if (th >= 0) sceKernelStartThread(th, 0, nullptr);
+    return th;
+}
+
+// -------------------------------------------------------------------------
+// Engine entry. GameMain is defined inside Engine/Source/Engine/Engine.cpp
+// and bundles ReadCommandLineArgs → OctPreInitialize → Initialize →
+// OctPostInitialize → loop(Update) → Shutdown. We just call it; the
+// callbacks above keep Home-button exit working.
+// -------------------------------------------------------------------------
+
+extern void GameMain(int32_t argc, char** argv);
+
+int main(int argc, char** argv)
+{
+    // Wipe last session's log first, then start writing checkpoints. If the
+    // engine crashes early we can read the file from the host afterwards and
+    // see exactly how far we got before the lights went out.
+    Psp_TruncateBootLog();
+    Psp_BootLog("[1] main() entered");
+
+    SetupCallbacks();
+    Psp_BootLog("[2] SetupCallbacks() returned");
+
+    Psp_BootLog("[3] About to call GameMain()");
+    GameMain(argc, argv);
+    Psp_BootLog("[4] GameMain() returned cleanly");
+
+    sceKernelExitGame();
+    return 0;
+}
+
+#endif // POLYPHASE_PLATFORM_ADDON
