@@ -29,6 +29,7 @@
 
 #include "Graphics/Graphics.h"
 #include "Graphics/GraphicsConstants.h"
+#include "Engine/Maths.h"   // DEGREES_TO_RADIANS for widget rotation
 #include "Engine/Renderer.h"
 #include "Engine/World.h"
 #include "Engine/Assets/Material.h"
@@ -408,11 +409,25 @@ namespace
     //       no shader; bake the same multiply+translate into the vertex
     //       buffer here.
     //
+    //   (4) Rotation around screen-space pivot. Widget::mTransform is a mat3
+    //       that's *supposed* to encode T(pivot) * R(angle) * T(-pivot), but
+    //       the engine builds it as mat4(translate*rotate*translate) and then
+    //       truncates to mat3 — which silently drops the translation columns
+    //       (glm's mat3(mat4) keeps only the upper-left 3x3). So we ignore
+    //       mTransform and apply rotation around pivot directly from
+    //       widget->GetRotation() / GetPivot(). Pivot must be in SCREEN space
+    //       (rect.mX + rect.mWidth*pivot.x, ditto Y) AFTER (3) has been
+    //       applied — otherwise text vertices would rotate around the wrong
+    //       point because their (3)-baked screen position differs from the
+    //       widget rect coordinates.
+    //
     // Returns nullptr to signal "skip the draw" when alpha rounds to 0.
     void* ApplyUIDrawTransform(const void* srcBuf, uint32_t numVerts,
                                const glm::vec4& tint, Texture* tex,
-                               glm::vec2 posScale = glm::vec2(1.0f, 1.0f),
-                               glm::vec2 posOffset = glm::vec2(0.0f, 0.0f))
+                               glm::vec2 posScale  = glm::vec2(1.0f, 1.0f),
+                               glm::vec2 posOffset = glm::vec2(0.0f, 0.0f),
+                               float rotRadians    = 0.0f,
+                               glm::vec2 pivot     = glm::vec2(0.0f, 0.0f))
     {
         if (srcBuf == nullptr || numVerts == 0) return nullptr;
 
@@ -440,6 +455,12 @@ namespace
             vScale = 2.0f;
         }
 
+        // Rotation fast-path: rotRadians ~= 0 means widget isn't rotated, so
+        // we skip the per-vertex sin/cos / pivot translate entirely.
+        const bool rotated = (fabsf(rotRadians) > 1e-6f);
+        const float cs = rotated ? cosf(rotRadians) : 1.0f;
+        const float sn = rotated ? sinf(rotRadians) : 0.0f;
+
         const uint32_t bytes = numVerts * sizeof(PspUIVertex);
         void* dst = GetUIScratch(bytes);
         if (dst == nullptr) return const_cast<void*>(srcBuf);
@@ -450,8 +471,20 @@ namespace
         {
             d[i].u = s[i].u * uScale;
             d[i].v = s[i].v * vScale;
-            d[i].x = s[i].x * posScale.x + posOffset.x;
-            d[i].y = s[i].y * posScale.y + posOffset.y;
+
+            float x = s[i].x * posScale.x + posOffset.x;
+            float y = s[i].y * posScale.y + posOffset.y;
+
+            if (rotated)
+            {
+                const float dx = x - pivot.x;
+                const float dy = y - pivot.y;
+                x = pivot.x + dx * cs - dy * sn;
+                y = pivot.y + dx * sn + dy * cs;
+            }
+
+            d[i].x = x;
+            d[i].y = y;
             d[i].z = s[i].z;
 
             // engine packs R in low byte (verified Phase 2)
@@ -465,6 +498,19 @@ namespace
         }
         sceKernelDcacheWritebackRange(dst, bytes);
         return dst;
+    }
+
+    // Compute widget's screen-space pivot point + rotation in radians for
+    // ApplyUIDrawTransform. mRect already has the pivot shift applied (see
+    // Widget::UpdateRect lines around 745), so the pivot in screen space is
+    // simply rect.mX + rect.mWidth * pivot.x, ditto Y.
+    void GetWidgetRotation(Widget* w, float& outRadians, glm::vec2& outPivot)
+    {
+        const Rect r = w->GetRect();
+        const glm::vec2 p = w->GetPivot();
+        outRadians = w->GetRotation() * DEGREES_TO_RADIANS;
+        outPivot   = glm::vec2(r.mX + r.mWidth * p.x,
+                               r.mY + r.mHeight * p.y);
     }
 
     // Per-widget upload helper used by Quad / Text / Poly. Repacks engine
@@ -1115,7 +1161,11 @@ void GFX_DrawQuad(Quad* quad)
         ++sQuadDbg;
     }
 
-    void* drawBuf = ApplyUIDrawTransform(r->mVertexData, n, quad->GetColor(), quad->GetTexture());
+    float rotRad; glm::vec2 pivot;
+    GetWidgetRotation(quad, rotRad, pivot);
+    void* drawBuf = ApplyUIDrawTransform(r->mVertexData, n, quad->GetColor(), quad->GetTexture(),
+                                         glm::vec2(1.0f, 1.0f), glm::vec2(0.0f, 0.0f),
+                                         rotRad, pivot);
     if (drawBuf == nullptr) return;   // tint alpha = 0
 
     SetupUIPipeline();
@@ -1175,7 +1225,12 @@ void GFX_DrawQuadBorder(Quad* quad)
 
     // Border uses GetBorderColor() as the uniform tint, not GetColor().
     // No texture (white fallback in BindUITexture), so pass nullptr.
-    void* drawBuf = ApplyUIDrawTransform(r->mVertexData, n, quad->GetBorderColor(), nullptr);
+    // Border rotates with the parent Quad.
+    float rotRad; glm::vec2 pivot;
+    GetWidgetRotation(quad, rotRad, pivot);
+    void* drawBuf = ApplyUIDrawTransform(r->mVertexData, n, quad->GetBorderColor(), nullptr,
+                                         glm::vec2(1.0f, 1.0f), glm::vec2(0.0f, 0.0f),
+                                         rotRad, pivot);
     if (drawBuf == nullptr) return;
 
     SetupUIPipeline();
@@ -1277,9 +1332,12 @@ void GFX_DrawText(Text* text)
     const glm::vec2 posScale(textScale, textScale);
     const glm::vec2 posOffset(rect.mX + justified.x, rect.mY + justified.y);
 
+    float rotRad; glm::vec2 pivot;
+    GetWidgetRotation(text, rotRad, pivot);
     void* drawBuf = ApplyUIDrawTransform(r->mVertexData, numVerts,
                                          text->GetColor(), fontTex,
-                                         posScale, posOffset);
+                                         posScale, posOffset,
+                                         rotRad, pivot);
     if (drawBuf == nullptr) return;
 
     SetupUIPipeline();
@@ -1333,7 +1391,11 @@ void GFX_DrawPoly(Poly* poly)
     }
 
     // Poly draws as line-strip with the white fallback — no texture sampling.
-    void* drawBuf = ApplyUIDrawTransform(r->mVertexData, n, poly->GetColor(), nullptr);
+    float rotRad; glm::vec2 pivot;
+    GetWidgetRotation(poly, rotRad, pivot);
+    void* drawBuf = ApplyUIDrawTransform(r->mVertexData, n, poly->GetColor(), nullptr,
+                                         glm::vec2(1.0f, 1.0f), glm::vec2(0.0f, 0.0f),
+                                         rotRad, pivot);
     if (drawBuf == nullptr) return;
 
     SetupUIPipeline();
