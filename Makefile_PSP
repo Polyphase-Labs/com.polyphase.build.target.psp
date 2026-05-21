@@ -23,7 +23,58 @@
 # every future Makefile-based build target.
 .DELETE_ON_ERROR:
 
-TARGET   = $(notdir $(CURDIR))
+# PROJECT_ROOT — absolute path to the user's project (where .octp / Source/ /
+# Generated/ / Packages/ live). Resolution priority:
+#   1. Set on the make command line by the PSP addon's GetCompileCommand
+#      (the normal path once you've rebuilt the addon DLL with the
+#      out-of-tree-build patch). Make is run from $(PROJECT_ROOT)/Intermediate/PSP/
+#      so all .o/.d/.elf intermediates land there.
+#   2. Walk-up from $(CURDIR) looking for a *.octp file (the project marker).
+#      Lets the same Makefile work for the OLD-style `make -C $(projectDir)`
+#      invocation (when the addon DLL hasn't been rebuilt yet) AND the new
+#      Intermediate/PSP/ invocation. Searches up to 3 levels:
+#        - $(CURDIR)         (old invocation: make -C projectDir)
+#        - $(CURDIR)/..      (someone in projectDir/SomeSubdir)
+#        - $(CURDIR)/../..   (new invocation: make -C projectDir/Intermediate/PSP)
+ifeq ($(origin PROJECT_ROOT), undefined)
+PROJECT_ROOT := $(strip \
+    $(if $(wildcard $(CURDIR)/*.octp),         $(CURDIR), \
+    $(if $(wildcard $(CURDIR)/../*.octp),      $(abspath $(CURDIR)/..), \
+    $(if $(wildcard $(CURDIR)/../../*.octp),   $(abspath $(CURDIR)/../..), \
+                                                ))))
+endif
+
+ifeq ($(strip $(PROJECT_ROOT)),)
+$(error Could not locate project root — no *.octp file found within 2 levels \
+  of $(CURDIR). Either pass PROJECT_ROOT=/path/to/project on the make line, \
+  or invoke make from your project's root directory or its Intermediate/PSP/ \
+  subdirectory.)
+endif
+
+# Normalise: strip trailing slash. GNU make's $(notdir foo/) returns empty
+# (notdir splits on the final '/'), so a trailing-slash PROJECT_ROOT would
+# yield TARGET="" → $(TARGET).elf = ".elf" → link fails silently → the
+# editor's post-build executable check reports "invalid executable, size=0".
+# Both the addon's GetCompileCommand and a manual `make PROJECT_ROOT=...`
+# invocation can accidentally include a trailing slash; normalize here so
+# the rest of the Makefile doesn't have to defend against it.
+#
+# `override` is REQUIRED here because PROJECT_ROOT is usually set on the
+# make command line (`make PROJECT_ROOT=...`), and GNU make's command-line
+# variable precedence silently ignores plain `:=` reassignments. Without
+# `override` the patsubst becomes a no-op and the trailing slash survives.
+override PROJECT_ROOT := $(patsubst %/,%,$(PROJECT_ROOT))
+
+ifeq ($(wildcard $(PROJECT_ROOT)/*.octp),)
+$(error Resolved PROJECT_ROOT='$(PROJECT_ROOT)' but it has no *.octp file. \
+  The walk-up heuristic found a non-project directory. Pass PROJECT_ROOT \
+  explicitly on the make line.)
+endif
+
+# TARGET is the project name — directory name of PROJECT_ROOT, not CURDIR
+# (which is Intermediate/PSP under the new invocation and would give a
+# useless "PSP.elf").
+TARGET   = $(notdir $(PROJECT_ROOT))
 
 # ---- Engine + addon paths ---------------------------------------------------
 # POLYPHASE_PATH resolution:
@@ -32,16 +83,24 @@ TARGET   = $(notdir $(CURDIR))
 #      lives (ctx->engineDir) and passes it explicitly so the walk-up
 #      heuristic never has to guess.
 #   2. Set in the environment.
-#   3. Walk-up from $(CURDIR) looking for Polyphase.sln. Only works when
+#   3. Walk-up from $(PROJECT_ROOT) looking for Polyphase.sln. Only works when
 #      the project dir is a direct descendant of the engine repo.
 #   4. /opt/Polyphase as a last-resort default.
 POLYPHASE_PATH ?= $(shell \
-    p=$(CURDIR); \
+    p=$(PROJECT_ROOT); \
     for i in 1 2 3 4 5 6; do \
         p=$$(dirname $$p); \
         if [ -f $$p/Polyphase.sln ]; then echo $$p; exit 0; fi; \
     done; \
     echo /opt/Polyphase )
+
+# Normalise: strip trailing slash — same reason as PROJECT_ROOT (notdir
+# returns empty on trailing slash). Less catastrophic for POLYPHASE_PATH
+# because it's used in $(POLYPHASE_PATH)/Engine/Source/... paths where the
+# extra slash is harmless, but normalise for consistency and to keep error
+# messages clean. `override` for the same command-line-precedence reason
+# as PROJECT_ROOT above.
+override POLYPHASE_PATH := $(patsubst %/,%,$(POLYPHASE_PATH))
 
 # Fail loudly if POLYPHASE_PATH doesn't resolve to a real engine. Without
 # this guard the link silently produces an .elf with only crt0.o because all
@@ -54,7 +113,7 @@ $(error POLYPHASE_PATH='$(POLYPHASE_PATH)' does not contain Engine/Source/Engine
   Inside WSL, Windows-side paths look like /mnt/<drive>/path/to/engine.)
 endif
 
-ADDON_PSP_RUNTIME = Packages/com.polyphase.build.target.psp/Runtime/PSP
+ADDON_PSP_RUNTIME = $(PROJECT_ROOT)/Packages/com.polyphase.build.target.psp/Runtime/PSP
 
 # ---- Source discovery -------------------------------------------------------
 # PSPSDK's build.mak does its own wildcard expansion against SOURCES, picking
@@ -108,11 +167,11 @@ SOURCES = \
     $(POLYPHASE_PATH)/External/recastnavigation/Detour/Source \
     $(ADDON_PSP_RUNTIME) \
     $(ADDON_PSP_RUNTIME)/Graphics_PSPGU \
-    Source
+    $(PROJECT_ROOT)/Source
 
 # ---- Include path -----------------------------------------------------------
 INCDIR = \
-    Generated \
+    $(PROJECT_ROOT)/Generated \
     $(ADDON_PSP_RUNTIME) \
     $(ADDON_PSP_RUNTIME)/Graphics_PSPGU \
     $(POLYPHASE_PATH)/Engine/Source \
@@ -148,11 +207,11 @@ CFILES   := $(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.c)))
 # isn't needed at runtime anyway. Scripts, however, only ship via the
 # embedded path (the cooker doesn't copy Scripts/ to disk for the package),
 # so this one file IS needed for Lua-attached components to actually run.
-ifneq ($(wildcard Generated/EmbeddedScripts.cpp),)
+ifneq ($(wildcard $(PROJECT_ROOT)/Generated/EmbeddedScripts.cpp),)
 CPPFILES += EmbeddedScripts.cpp
 endif
 
-VPATH := $(SOURCES) Generated
+VPATH := $(SOURCES) $(PROJECT_ROOT)/Generated
 OBJS  := $(CPPFILES:.cpp=.o) $(CFILES:.c=.o)
 
 # ---- Flags ------------------------------------------------------------------
@@ -241,14 +300,15 @@ include $(PSPSDK)/lib/build.mak
 
 # ---- Stage final ELF for the addon's GetCompiledBinaryPath ------------------
 # The addon's GetCompiledBinaryPath returns <projectDir>/Build/PSP/<name>.elf.
-# build.mak produces $(TARGET).elf in the current directory; we copy it to the
-# expected location so the rest of the build-target pipeline (binary mtime
+# build.mak produces $(TARGET).elf in $(CURDIR) (which is now
+# <projectDir>/Intermediate/PSP/); we copy it up two levels to the canonical
+# Build/PSP/ location so the rest of the build-target pipeline (binary mtime
 # check, copy-to-Packaged, pack-pbp wrap) finds it.
 all: stage
 stage: $(TARGET).elf
-	@mkdir -p Build/PSP
-	@cp $(TARGET).elf Build/PSP/$(TARGET).elf
-	@echo "Staged Build/PSP/$(TARGET).elf"
+	@mkdir -p $(PROJECT_ROOT)/Build/PSP
+	@cp $(TARGET).elf $(PROJECT_ROOT)/Build/PSP/$(TARGET).elf
+	@echo "Staged $(PROJECT_ROOT)/Build/PSP/$(TARGET).elf"
 
 cleanstage:
-	@rm -rf Build/PSP
+	@rm -rf $(PROJECT_ROOT)/Build/PSP

@@ -77,7 +77,24 @@ namespace
 
     // Default white texture used when a draw has no bound texture. Avoids the
     // PSP rendering grey/undefined garbage from whatever was last in TMU 0.
-    static uint32_t __attribute__((aligned(16))) sWhiteTexel[4] = {
+    //
+    // 4x4 (not 2x2) because PSP requires the texture buffer's row STRIDE to
+    // be a multiple of 16 BYTES — for PSM_8888 (4 B/texel) that's a
+    // bufWidth of at least 4 texels. Calling sceGuTexImage with bufWidth=2
+    // (stride=8 B) causes the GE's texture-sampler DMA to read row 0
+    // correctly but row 1 from the wrong offset (past the buffer), giving
+    // garbage / transparent results in the bottom half of the texture.
+    //
+    // Symptom: untextured widgets (Button quad fills, QuadBorder, Poly
+    // lines, anything using the white fallback) rendered with their top
+    // half tinted correctly and their bottom half empty / transparent —
+    // because UV.y < 0.5 sampled valid white texels but UV.y >= 0.5
+    // sampled garbage. Fixed by making the fallback 4x4 and passing
+    // bufWidth=4 to sceGuTexImage.
+    static uint32_t __attribute__((aligned(16))) sWhiteTexel[16] = {
+        0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu,
+        0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu,
+        0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu,
         0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu,
     };
 
@@ -367,21 +384,64 @@ namespace
         return *bufp;
     }
 
-    // Scratch buffer for per-draw CPU transforms (used by Text — engine
-    // builds text verts in font-cursor local space, but PSP TRANSFORM_2D has
-    // no matrix slot so we bake the rect-offset + scale into positions each
-    // draw). Grows on demand.
-    static void*    sUIScratch    = nullptr;
-    static uint32_t sUIScratchCap = 0;
+    // Frame-scoped ring buffer for per-draw CPU vertex transforms
+    // (ApplyUIDrawTransform writes UV-scaled + tint-modulated + position-
+    // baked vertex copies here, since Text/Quad widgets can't be modified
+    // in-place — the next dirty cycle would re-apply the transform on
+    // already-transformed data).
+    //
+    // The ring is reset at GFX_BeginFrame and never freed mid-frame, so a
+    // slice handed out to one draw stays valid until sceGuSync at end-of-
+    // frame. This is mandatory on PSP: sceGuDrawArray records the vertex
+    // POINTER into the GE command list and the GE consumes it
+    // asynchronously between sceGuFinish/sceGuSync, NOT at the call site.
+    // Reusing a single scratch buffer means every draw's pointer aliases
+    // the same memory, so the GE reads whatever the LAST writer left
+    // behind. Symptom: button quads rendering with vertices from some
+    // unrelated text draw — "anchored at top, bottom empty" was caused by
+    // exactly this aliasing.
+    //
+    // 256 KB is plenty: each Phase 4 UI vertex is 24 B, and even a busy
+    // frame with a few hundred buttons/text widgets at ~50 verts each
+    // tops out around 100 KB. Grows on overflow so we never silently drop.
+    static constexpr uint32_t kUIRingInitialBytes = 256 * 1024;
+    static void*    sUIRing        = nullptr;
+    static uint32_t sUIRingCap     = 0;
+    static uint32_t sUIRingOffset  = 0;
 
     void* GetUIScratch(uint32_t bytes)
     {
-        if (sUIScratchCap >= bytes && sUIScratch != nullptr) return sUIScratch;
-        if (sUIScratch != nullptr) { free(sUIScratch); sUIScratch = nullptr; }
-        sUIScratch = memalign(16, bytes);
-        sUIScratchCap = (sUIScratch != nullptr) ? bytes : 0;
-        return sUIScratch;
+        // 16-byte align each slice — PSP DMA requires it for vertex reads.
+        const uint32_t alignedBytes = (bytes + 15u) & ~15u;
+
+        // Grow on first call or on overflow. Free + reallocate (rather
+        // than realloc) because any extant slices belong to in-flight
+        // sceGuDrawArray pointers that won't be touched until sceGuSync
+        // at end-of-frame, but we only grow at the START of a draw before
+        // any GE work has begun for the current frame's UI batch — so it's
+        // safe to drop the old buffer.
+        if (sUIRing == nullptr ||
+            sUIRingOffset + alignedBytes > sUIRingCap)
+        {
+            const uint32_t newCap =
+                glm::max(sUIRingCap > 0 ? sUIRingCap * 2 : kUIRingInitialBytes,
+                         sUIRingOffset + alignedBytes);
+            if (sUIRing != nullptr) free(sUIRing);
+            sUIRing       = memalign(16, newCap);
+            sUIRingCap    = (sUIRing != nullptr) ? newCap : 0;
+            sUIRingOffset = 0;
+        }
+        if (sUIRing == nullptr) return nullptr;
+
+        uint8_t* slice = static_cast<uint8_t*>(sUIRing) + sUIRingOffset;
+        sUIRingOffset += alignedBytes;
+        return slice;
     }
+
+    // Reset the ring at frame start. Safe because sceGuSync at the end of
+    // the previous frame guarantees the GE has consumed every pointer
+    // handed out from the ring during that frame.
+    void ResetUIScratch() { sUIRingOffset = 0; }
 
     // Returns the buffer the GE should draw from after applying the widget's
     // uniform tint, scaling normalised UVs to PSP texel units, and optionally
@@ -439,8 +499,10 @@ namespace
         if ((uint8_t)(ta * 255.0f) == 0) return nullptr;
 
         // Texture dims for the UV multiply. Null / unloaded textures fall
-        // through to a 2x2 white fallback in BindUITexture; UVs there don't
-        // need scaling because every texel is white.
+        // through to a 4x4 white fallback in BindUITexture (was 2x2 — PSP
+        // PSM_8888 needs bufWidth >= 4 to satisfy the 16-byte row-stride
+        // requirement; see sWhiteTexel comment). All 16 texels are white,
+        // so any UV samples white regardless of how we scale here.
         float uScale = 1.0f;
         float vScale = 1.0f;
         if (tex != nullptr && tex->GetResource() != nullptr &&
@@ -451,8 +513,8 @@ namespace
         }
         else
         {
-            uScale = 2.0f;
-            vScale = 2.0f;
+            uScale = 4.0f;
+            vScale = 4.0f;
         }
 
         // Rotation fast-path: rotRadians ~= 0 means widget isn't rotated, so
@@ -563,7 +625,10 @@ namespace
         if (tex == nullptr || tex->GetResource() == nullptr ||
             tex->GetResource()->mPixels == nullptr)
         {
-            sceGuTexImage(0, 2, 2, 2, sWhiteTexel);
+            // 4x4 white fallback — see sWhiteTexel comment for why 2x2 is
+            // unsafe on PSP (bufWidth < 4 violates 16-byte stride alignment
+            // for PSM_8888 and the GE reads garbage on the second row).
+            sceGuTexImage(0, 4, 4, 4, sWhiteTexel);
             sceGuTexFunc(GU_TFX_MODULATE, GU_TCC_RGBA);
             sceGuTexFilter(GU_NEAREST, GU_NEAREST);
             sceGuTexWrap(GU_CLAMP, GU_CLAMP);
@@ -609,7 +674,10 @@ namespace
             // colour set via sceGuColor in BindMaterial passes through —
             // otherwise an untextured brown-coloured material renders as
             // pure white.
-            sceGuTexImage(0, 2, 2, 2, sWhiteTexel);
+            // 4x4 white fallback — see sWhiteTexel comment for why 2x2 is
+            // unsafe on PSP (bufWidth=2 violates the 16-byte stride
+            // requirement for PSM_8888 and the second row reads garbage).
+            sceGuTexImage(0, 4, 4, 4, sWhiteTexel);
             sceGuTexFunc(GU_TFX_MODULATE, GU_TCC_RGBA);
             sceGuTexFilter(GU_NEAREST, GU_NEAREST);
             sceGuTexWrap(GU_REPEAT, GU_REPEAT);
@@ -707,6 +775,12 @@ void GFX_BeginFrame()
 {
     if (!sGuInitialised) return;
     sceGuStart(GU_DIRECT, sGuCmdList);
+
+    // Reset the UI-vertex ring buffer so this frame's draws start with a
+    // clean offset. The previous frame's sceGuSync at GFX_EndFrame already
+    // guaranteed the GE has consumed every pointer we handed out last
+    // frame — safe to overwrite from byte 0 again.
+    ResetUIScratch();
 
     glm::vec4 cc = Renderer::Get() ? Renderer::Get()->GetClearColor() : glm::vec4(0, 0, 0, 1);
     cc.a = 1.0f;  // force opaque

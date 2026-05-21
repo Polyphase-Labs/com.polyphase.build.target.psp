@@ -325,22 +325,43 @@ namespace
         char jobsArg[16];
         std::snprintf(jobsArg, sizeof(jobsArg), " -j%d", jobs);
 
-        // Force Rebuild: prepend `rm -f *.o *.d *.elf` so the next make starts
-        // from zero objects. Necessary because PSPSDK's build.mak emits no .d
-        // dep files, so header-only changes never invalidate stale .o's.
+        // Out-of-tree build: all .o / .d intermediates live in
+        // <projectDir>/Intermediate/PSP/ instead of being scattered across the
+        // project root. Make's CWD = Intermediate/PSP/, and the Makefile's
+        // PROJECT_ROOT variable lets it find source/include/output paths
+        // relative to the user's actual project. Keeps the project root clean
+        // and `git add .`-safe.
+        const std::string intermediateDir =
+            std::string(ctx->projectDir) + "/Intermediate/PSP";
+        const std::string mkIntermediate =
+            "mkdir -p " + ShellPath(intermediateDir) + " && ";
+
+        // Force Rebuild: clean *.o / *.d / *.elf in the intermediate dir AND
+        // the staged binary in Build/PSP. Necessary because PSPSDK's
+        // build.mak emits no .d dep files, so header-only changes never
+        // invalidate stale .o's.
         std::string cleanPrefix;
         if (ctx->forceRebuild)
         {
             cleanPrefix =
-                "(cd " + ShellPath(ctx->projectDir) +
-                " && rm -f *.o *.d *.elf Build/PSP/*.elf 2>/dev/null; true) && ";
+                "(cd " + ShellPath(intermediateDir) +
+                " && rm -f *.o *.d *.elf 2>/dev/null; true) && " +
+                "(rm -f " + ShellPath(std::string(ctx->projectDir) + "/Build/PSP") +
+                "/*.elf 2>/dev/null; true) && ";
         }
 
+        // Pass PROJECT_ROOT explicitly so the Makefile doesn't have to derive
+        // it from CURDIR (which works for the standard layout but breaks if
+        // someone moves Intermediate/ elsewhere).
+        const std::string makeProjectRoot =
+            " PROJECT_ROOT=" + ShellPath(ctx->projectDir);
+
         const std::string body =
+            mkIntermediate +
             cleanPrefix +
-            "make -C " + ShellPath(ctx->projectDir) +
+            "make -C " + ShellPath(intermediateDir) +
             " -f " + ShellPath(makefilePath) +
-            makePspDev + makePolyphasePath + jobsArg;
+            makeProjectRoot + makePspDev + makePolyphasePath + jobsArg;
 
         std::snprintf(outCmd, cap, "%s", WrapShell(ctx, body).c_str());
         return 1;
