@@ -35,9 +35,11 @@
 #include "Engine/Assets/Material.h"
 #include "Engine/Assets/MaterialLite.h"
 #include "Engine/Assets/StaticMesh.h"
+#include "Engine/Assets/SkeletalMesh.h"
 #include "Engine/Assets/Texture.h"
 #include "Engine/Assets/Font.h"
 #include "Engine/Nodes/3D/StaticMesh3d.h"
+#include "Engine/Nodes/3D/SkeletalMesh3d.h"
 #include "Engine/Nodes/3D/Camera3d.h"
 #include "Engine/Nodes/Widgets/Widget.h"
 #include "Engine/Nodes/Widgets/Quad.h"
@@ -1058,11 +1060,55 @@ void GFX_DestroyStaticMeshResource(StaticMesh* staticMesh)
 }
 
 // =============================================================================
-// Skeletal mesh — Phase 3
+// Skeletal mesh — CPU-skinned, indexed draw
+//
+// Strategy:
+//   - GFX_IsCpuSkinningRequired returns true → engine CPU-skins every frame
+//     and hands us a std::vector<Vertex> (engine layout) via
+//     GFX_UpdateSkeletalMeshCompVertexBuffer.
+//   - Mesh resource keeps a copy of the bind-pose mesh's *indices* (those
+//     don't change per frame). The bind-pose VertexSkinned* data is
+//     ignored — only the comp's per-frame skinned vertex buffer is drawn.
+//   - Component resource holds a dynamic per-frame vertex buffer in PSP
+//     HW format (psp::StaticVertex — same layout the static-mesh path uses).
+//   - GFX_DrawSkeletalMeshComp binds material+texture+world matrix then
+//     sceGuDrawArray with comp's vertex buffer + mesh's indices.
+//
+// HW skinning via GU_WEIGHTS(n) + sceGuBoneMatrix is possible but limited
+// to 8 bones per draw. Real models routinely exceed that; partitioning is
+// non-trivial. CPU path works for any bone count and matches what the
+// engine's GameCube path does today.
 // =============================================================================
 
-void GFX_CreateSkeletalMeshResource(SkeletalMesh* /*sm*/, uint32_t /*numVerts*/, VertexSkinned* /*verts*/, uint32_t /*numIdx*/, IndexType* /*idx*/) {}
-void GFX_DestroySkeletalMeshResource(SkeletalMesh* /*sm*/) {}
+void GFX_CreateSkeletalMeshResource(SkeletalMesh* sm,
+                                    uint32_t /*numVerts*/,
+                                    VertexSkinned* /*verts*/,
+                                    uint32_t numIdx,
+                                    IndexType* idx)
+{
+    if (sm == nullptr || idx == nullptr || numIdx == 0) return;
+    SkeletalMeshResource* r = sm->GetResource();
+    if (r == nullptr) return;
+
+    const uint32_t iBytes = sizeof(IndexType) * numIdx;
+    void* iBuf = memalign(16, iBytes);
+    if (iBuf == nullptr) return;
+    memcpy(iBuf, idx, iBytes);
+
+    r->mIndexData  = iBuf;
+    r->mNumIndices = numIdx;
+
+    sceKernelDcacheWritebackRange(iBuf, iBytes);
+}
+
+void GFX_DestroySkeletalMeshResource(SkeletalMesh* sm)
+{
+    if (sm == nullptr) return;
+    SkeletalMeshResource* r = sm->GetResource();
+    if (r == nullptr) return;
+    if (r->mIndexData != nullptr) { free(r->mIndexData); r->mIndexData = nullptr; }
+    r->mNumIndices = 0;
+}
 
 // =============================================================================
 // Comp resources
@@ -1138,12 +1184,120 @@ void GFX_DrawStaticMeshComp(StaticMesh3D* comp, StaticMesh* meshOverride)
 // The remaining GFX_* surface — stubs until later phases
 // =============================================================================
 
-void GFX_CreateSkeletalMeshCompResource(SkeletalMesh3D* /*c*/) {}
-void GFX_DestroySkeletalMeshCompResource(SkeletalMesh3D* /*c*/) {}
-void GFX_ReallocateSkeletalMeshCompVertexBuffer(SkeletalMesh3D* /*c*/, uint32_t /*n*/) {}
-void GFX_UpdateSkeletalMeshCompVertexBuffer(SkeletalMesh3D* /*c*/, const std::vector<Vertex>& /*sv*/) {}
-void GFX_DrawSkeletalMeshComp(SkeletalMesh3D* /*c*/) {}
-bool GFX_IsCpuSkinningRequired(SkeletalMesh3D* /*c*/) { return true; }
+void GFX_CreateSkeletalMeshCompResource(SkeletalMesh3D* /*c*/)
+{
+    // No-op — the per-frame vertex buffer is allocated lazily on the first
+    // GFX_ReallocateSkeletalMeshCompVertexBuffer call (engine knows the
+    // skinned-vertex count, we don't until then). The SkeletalMeshCompResource
+    // struct's pointers default-init to nullptr, which is the correct
+    // "not yet allocated" state for the destroy path.
+}
+
+void GFX_DestroySkeletalMeshCompResource(SkeletalMesh3D* c)
+{
+    if (c == nullptr) return;
+    SkeletalMeshCompResource* r = c->GetResource();
+    if (r == nullptr) return;
+    if (r->mVertexData != nullptr) { free(r->mVertexData); r->mVertexData = nullptr; }
+    r->mVertexCapacity = 0;
+    r->mNumVertices    = 0;
+    r->mVertexStride   = 0;
+}
+
+void GFX_ReallocateSkeletalMeshCompVertexBuffer(SkeletalMesh3D* c, uint32_t numVerts)
+{
+    if (c == nullptr || numVerts == 0) return;
+    SkeletalMeshCompResource* r = c->GetResource();
+    if (r == nullptr) return;
+
+    const uint32_t stride = sizeof(psp::StaticVertex);
+    const uint32_t needed = stride * numVerts;
+    if (r->mVertexCapacity >= needed && r->mVertexData != nullptr)
+    {
+        // Existing buffer is large enough — just update the high-water count.
+        r->mNumVertices  = numVerts;
+        r->mVertexStride = stride;
+        return;
+    }
+
+    if (r->mVertexData != nullptr) { free(r->mVertexData); r->mVertexData = nullptr; }
+    r->mVertexData     = memalign(16, needed);
+    r->mVertexCapacity = (r->mVertexData != nullptr) ? needed : 0;
+    r->mNumVertices    = (r->mVertexData != nullptr) ? numVerts : 0;
+    r->mVertexStride   = stride;
+}
+
+void GFX_UpdateSkeletalMeshCompVertexBuffer(SkeletalMesh3D* c,
+                                            const std::vector<Vertex>& skinnedVertices)
+{
+    if (c == nullptr || skinnedVertices.empty()) return;
+    SkeletalMeshCompResource* r = c->GetResource();
+    if (r == nullptr) return;
+
+    const uint32_t n = (uint32_t)skinnedVertices.size();
+    const uint32_t needed = sizeof(psp::StaticVertex) * n;
+
+    // Defensive grow — the engine calls Reallocate first, but if the skin
+    // produces more verts than expected we'd otherwise blow past the buffer.
+    if (r->mVertexCapacity < needed || r->mVertexData == nullptr)
+    {
+        GFX_ReallocateSkeletalMeshCompVertexBuffer(c, n);
+        if (r->mVertexData == nullptr) return;
+    }
+
+    psp::RepackVertices(skinnedVertices.data(), n,
+                        static_cast<psp::StaticVertex*>(r->mVertexData));
+    r->mNumVertices = n;
+
+    sceKernelDcacheWritebackRange(r->mVertexData, needed);
+}
+
+void GFX_DrawSkeletalMeshComp(SkeletalMesh3D* c)
+{
+    if (!sGuInitialised || c == nullptr) return;
+
+    SkeletalMesh* mesh = c->GetSkeletalMesh();
+    if (mesh == nullptr) return;
+
+    SkeletalMeshResource* mr = mesh->GetResource();
+    SkeletalMeshCompResource* cr = c->GetResource();
+    if (mr == nullptr || cr == nullptr) return;
+    if (mr->mIndexData == nullptr || mr->mNumIndices == 0) return;
+    if (cr->mVertexData == nullptr || cr->mNumVertices == 0) return;
+
+    // Same material+texture binding pattern as StaticMesh3D — read material
+    // from the comp (fall back to the renderer's default), bind, then bind
+    // its base texture.
+    Material* matBase = c->GetMaterial();
+    MaterialLite* mat = Material::AsLite(matBase ? matBase : Renderer::Get()->GetDefaultMaterial());
+    BindMaterial(mat, /*useVertexColor=*/false);
+    BindTexture(mat ? mat->GetTexture(0) : nullptr);
+
+    // World matrix from the comp's render transform. View+projection were
+    // already set by BeginRenderPass(Forward).
+    ScePspFMatrix4 worldMtx;
+    const glm::mat4& world = c->GetRenderTransform();
+    memcpy(&worldMtx, &world[0][0], sizeof(float) * 16);
+    sceGuSetMatrix(GU_MODEL, &worldMtx);
+
+    // psp::kStaticVertexFlags already includes GU_INDEX_16BIT + GU_TRANSFORM_3D
+    // plus the tex/normal/pos format flags matching psp::StaticVertex layout.
+    sceGuDrawArray(GU_TRIANGLES,
+                   psp::kStaticVertexFlags,
+                   (int)mr->mNumIndices,
+                   mr->mIndexData,
+                   cr->mVertexData);
+}
+
+bool GFX_IsCpuSkinningRequired(SkeletalMesh3D* /*c*/)
+{
+    // PSP HW skinning (sceGuBoneMatrix + GU_WEIGHTS) is capped at 8 bones
+    // per draw — most real models exceed that and would need per-batch
+    // partitioning. CPU skinning is uncapped and matches GameCube/3DS
+    // defaults. Optimisation for future: switch this to a per-comp check
+    // that returns false when bone count <= 8 and use the HW path then.
+    return true;
+}
 
 void GFX_DrawShadowMeshComp(ShadowMesh3D* /*c*/) {}
 void GFX_DrawInstancedMeshComp(InstancedMesh3D* /*c*/) {}
