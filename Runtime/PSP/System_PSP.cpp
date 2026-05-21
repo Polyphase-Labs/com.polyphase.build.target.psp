@@ -37,6 +37,7 @@
 #include <pspge.h>
 
 #include <stdio.h>
+#include <string>
 #include <string.h>
 #include <stdlib.h>
 #include <malloc.h>
@@ -482,16 +483,106 @@ float SYS_GetTotalRAM1()   { return SYS_GetTotalRAM(); }
 float SYS_GetTotalRAM2()   { return 0.0f; }
 
 // =========================================================================
-// Save data — V1: stub. Real PSP saves live under ms0:/PSP/SAVEDATA/<GAMEID>/
-// and need PARAM.SFO + ICON0/PIC1 to appear in the XMB save browser. For Phase
-// 1, treat as "no save support" and let the engine fall back.
+// Save data — files under ms0:/PSP/SAVEDATA/<GAMEID>/<saveName>.
+//
+// The <GAMEID> path component must match `psp.discId` in the build profile
+// (defaults to POLY00001, baked into PARAM.SFO via mksfoex at PostPackage
+// time). If you change the disc ID in the profile, change `kSaveGameId`
+// below to match — otherwise saves go to a different folder than the one
+// the firmware's save-data utility shows for your game.
+//
+// We skip the official per-save subdir + PARAM.SFO + ICON0.PNG layout that
+// the XMB's "Saved Data Utility" expects — that integration needs sceUtilitySavedataInitStart
+// and a dialog UI flow. For an engine doing free-form `SYS_WriteSave("foo.sav")`
+// the simpler flat layout under one shared folder works on every PSP and
+// PPSSPP without dialog interruption. Games that want true XMB integration
+// can call sceUtility* themselves.
+//
+// File I/O goes through stdio (Stream::ReadFile/WriteFile use fopen) —
+// PSPSDK's newlib maps "ms0:/..." paths transparently to the PSP IO API, so
+// the same code that runs on Linux works here.
 // =========================================================================
 
-bool SYS_ReadSave(const char* /*saveName*/, Stream& /*outStream*/)        { return false; }
-bool SYS_WriteSave(const char* /*saveName*/, Stream& /*stream*/)           { return false; }
-bool SYS_DoesSaveExist(const char* /*saveName*/)                            { return false; }
-bool SYS_DeleteSave(const char* /*saveName*/)                               { return false; }
-void SYS_UnmountMemoryCard()                                                { }
+namespace
+{
+    constexpr const char* kSaveGameId = "POLY00001";
+
+    inline std::string SavePath(const char* saveName)
+    {
+        std::string p = "ms0:/PSP/SAVEDATA/";
+        p += kSaveGameId;
+        p += "/";
+        p += saveName;
+        return p;
+    }
+
+    inline void EnsureSaveDirExists()
+    {
+        // sceIoMkdir is single-level only — walk the tree. EEXIST returns a
+        // negative rc but is harmless; the only failure that matters is the
+        // final mkdir, and the subsequent fopen will error visibly anyway.
+        sceIoMkdir("ms0:/PSP", 0777);
+        sceIoMkdir("ms0:/PSP/SAVEDATA", 0777);
+        std::string base = "ms0:/PSP/SAVEDATA/";
+        base += kSaveGameId;
+        sceIoMkdir(base.c_str(), 0777);
+    }
+}
+
+bool SYS_ReadSave(const char* saveName, Stream& outStream)
+{
+    if (saveName == nullptr) return false;
+    if (!SYS_DoesSaveExist(saveName))
+    {
+        LogWarning("SYS_ReadSave: '%s' does not exist", saveName);
+        return false;
+    }
+    const std::string path = SavePath(saveName);
+    outStream.ReadFile(path.c_str(), /*isAsset=*/false);
+    return outStream.GetSize() > 0;
+}
+
+bool SYS_WriteSave(const char* saveName, Stream& stream)
+{
+    if (saveName == nullptr) return false;
+    EnsureSaveDirExists();
+    const std::string path = SavePath(saveName);
+    const bool ok = stream.WriteFile(path.c_str());
+    if (ok)
+    {
+        LogDebug("Save written: %s (%u bytes) -> %s",
+                 saveName, (unsigned)stream.GetSize(), path.c_str());
+    }
+    else
+    {
+        LogError("SYS_WriteSave: failed to write '%s'", path.c_str());
+    }
+    return ok;
+}
+
+bool SYS_DoesSaveExist(const char* saveName)
+{
+    if (saveName == nullptr) return false;
+    const SceUID fd = sceIoOpen(SavePath(saveName).c_str(), PSP_O_RDONLY, 0);
+    if (fd < 0) return false;
+    sceIoClose(fd);
+    return true;
+}
+
+bool SYS_DeleteSave(const char* saveName)
+{
+    if (saveName == nullptr) return false;
+    const int rc = sceIoRemove(SavePath(saveName).c_str());
+    return rc >= 0;
+}
+
+void SYS_UnmountMemoryCard()
+{
+    // PSP firmware auto-manages the memory stick lifecycle; nothing to do.
+    // (Unmount-on-eject would need sceMsCmRegisterMSInsertEjectCallback +
+    // a dedicated thread — out of scope; the typical homebrew flow just
+    // refuses to launch if the stick is missing.)
+}
 
 // =========================================================================
 // Clipboard — N/A
