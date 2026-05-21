@@ -40,6 +40,7 @@
 #include "Engine/Assets/Font.h"
 #include "Engine/Nodes/3D/StaticMesh3d.h"
 #include "Engine/Nodes/3D/SkeletalMesh3d.h"
+#include "Engine/Nodes/3D/InstancedMesh3d.h"
 #include "Engine/Nodes/3D/Camera3d.h"
 #include "Engine/Nodes/Widgets/Widget.h"
 #include "Engine/Nodes/Widgets/Quad.h"
@@ -1300,7 +1301,61 @@ bool GFX_IsCpuSkinningRequired(SkeletalMesh3D* /*c*/)
 }
 
 void GFX_DrawShadowMeshComp(ShadowMesh3D* /*c*/) {}
-void GFX_DrawInstancedMeshComp(InstancedMesh3D* /*c*/) {}
+
+// PSP has no HW instancing — fixed-function GE has no per-instance vertex
+// attribute mechanism, no SSBO, no shader to read a transform array from. So
+// we issue one draw per instance with sceGuSetMatrix in between. The mesh
+// resource itself (vertex/index buffers) and the material+texture binding
+// stay set across the loop — only the world matrix changes per iteration.
+//
+// Performance: each iteration is one matrix upload + one sceGuDrawArray. For
+// modest instance counts (foliage clumps, scatter props in the dozens-to-
+// hundreds range) this is fine on PSP. For thousands of instances per draw
+// you'd want a display-list batch or HW-skin-style trick — out of scope
+// here; cross that bridge when an actual scene needs it.
+void GFX_DrawInstancedMeshComp(InstancedMesh3D* comp)
+{
+    if (!sGuInitialised || comp == nullptr) return;
+
+    StaticMesh* mesh = comp->GetStaticMesh();
+    if (mesh == nullptr) return;
+
+    StaticMeshResource* r = mesh->GetResource();
+    if (r == nullptr || r->mVertexData == nullptr || r->mIndexData == nullptr) return;
+    if (r->mNumIndices == 0) return;
+
+    const uint32_t numInstances = comp->GetNumInstances();
+    if (numInstances == 0) return;
+
+    // Bind material+texture ONCE for all instances — they're shared. Same
+    // pattern as DrawStaticMeshComp; the only thing that varies per
+    // instance is the world matrix.
+    Material* matBase = comp->GetMaterial();
+    MaterialLite* mat = Material::AsLite(matBase ? matBase : Renderer::Get()->GetDefaultMaterial());
+    BindMaterial(mat, /*useVertexColor=*/false);
+    BindTexture(mat ? mat->GetTexture(0) : nullptr);
+
+    const glm::mat4& compXform = comp->GetRenderTransform();
+
+    for (uint32_t i = 0; i < numInstances; ++i)
+    {
+        // CalculateInstanceTransform returns the instance's transform
+        // RELATIVE TO THE COMP — combine with the comp's render transform
+        // to get the instance's true world matrix. Vulkan does the same
+        // multiply in the vertex shader's SSBO read; we do it CPU-side.
+        const glm::mat4 worldXform = compXform * comp->CalculateInstanceTransform((int32_t)i);
+
+        ScePspFMatrix4 worldMtx;
+        memcpy(&worldMtx, &worldXform[0][0], sizeof(float) * 16);
+        sceGuSetMatrix(GU_MODEL, &worldMtx);
+
+        sceGuDrawArray(GU_TRIANGLES,
+                       r->mVertexFlags,
+                       (int)r->mNumIndices,
+                       r->mIndexData,
+                       r->mVertexData);
+    }
+}
 
 void GFX_CreateTextMeshCompResource(TextMesh3D* /*c*/) {}
 void GFX_DestroyTextMeshCompResource(TextMesh3D* /*c*/) {}
