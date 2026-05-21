@@ -108,8 +108,19 @@ PSP_MAIN_THREAD_STACK_SIZE_KB(256);
 void OctPreInitialize(EngineConfig& config)
 {
     GetEngineState()->mStandalone = true;
-    if (config.mWindowWidth == 0)  config.mWindowWidth  = 480;
-    if (config.mWindowHeight == 0) config.mWindowHeight = 272;
+
+    // Force PSP screen dimensions UNCONDITIONALLY. The previous
+    // `if (config.mWindowWidth == 0)` guard never fired because
+    // EngineConfig defaults mWindowWidth/Height to DEFAULT_WINDOW_WIDTH
+    // (1280x720). Without this override the engine's Renderer reports a
+    // 1280x720 viewport to Widget::UpdateRect, so any UI widget anchored as
+    // FullStretch with Size=[0.5,0.5] computes mRect=(0,0,640,360) on PSP —
+    // PSP's scissor clips at (480,272) so the visible portion is the
+    // upper-left 75% of the over-sized quad, which (when textured with the
+    // PSP_480x272 calibration card) looks like a fullscreen green wash
+    // because the texture's grid lines fall outside the clipped area.
+    config.mWindowWidth  = 480;
+    config.mWindowHeight = 272;
 
     config.mEmbeddedScriptCount = gNumEmbeddedScripts;
     config.mEmbeddedScripts     = gEmbeddedScripts;

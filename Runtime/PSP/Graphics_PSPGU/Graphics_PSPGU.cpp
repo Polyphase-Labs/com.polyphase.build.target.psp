@@ -382,6 +382,80 @@ namespace
         return sUIScratch;
     }
 
+    // Returns the buffer the GE should draw from after applying the widget's
+    // uniform tint AND scaling normalised UVs to PSP texel units.
+    //
+    // Two transforms baked into one scratch pass:
+    //
+    //   (1) Tint. Vulkan/GX apply widget uniform colour in a shader / TEV
+    //       stage; PSP has no shader and only one TEV stage (sceGuTexFunc),
+    //       so we pre-multiply tint into per-vertex colour.
+    //
+    //   (2) UV scale to texel units. PSP GU_TRANSFORM_2D ("through" mode)
+    //       interprets float texcoords as TEXEL coords, NOT normalised
+    //       0..1 like 3D mode. sceGuTexScale doesn't apply in through mode,
+    //       so we have to bake the multiply into the vertices: each UV gets
+    //       multiplied by the bound texture's width/height. Without this,
+    //       a widget UV=(0..1) samples one texel and shows up as a single-
+    //       colour smear (the user-visible "fullscreen green wash" bug).
+    //
+    // Returns nullptr to signal "skip the draw" when alpha rounds to 0.
+    void* ApplyUIDrawTransform(const void* srcBuf, uint32_t numVerts,
+                               const glm::vec4& tint, Texture* tex)
+    {
+        if (srcBuf == nullptr || numVerts == 0) return nullptr;
+
+        const float tr = glm::clamp(tint.r, 0.0f, 1.0f);
+        const float tg = glm::clamp(tint.g, 0.0f, 1.0f);
+        const float tb = glm::clamp(tint.b, 0.0f, 1.0f);
+        const float ta = glm::clamp(tint.a, 0.0f, 1.0f);
+
+        if ((uint8_t)(ta * 255.0f) == 0) return nullptr;
+
+        // Texture dims for the UV multiply. Null / unloaded textures fall
+        // through to a 2x2 white fallback in BindUITexture; UVs there don't
+        // need scaling because every texel is white.
+        float uScale = 1.0f;
+        float vScale = 1.0f;
+        if (tex != nullptr && tex->GetResource() != nullptr &&
+            tex->GetResource()->mPixels != nullptr)
+        {
+            uScale = (float)tex->GetResource()->mWidth;
+            vScale = (float)tex->GetResource()->mHeight;
+        }
+        else
+        {
+            uScale = 2.0f;
+            vScale = 2.0f;
+        }
+
+        const uint32_t bytes = numVerts * sizeof(PspUIVertex);
+        void* dst = GetUIScratch(bytes);
+        if (dst == nullptr) return const_cast<void*>(srcBuf);
+
+        const PspUIVertex* s = static_cast<const PspUIVertex*>(srcBuf);
+        PspUIVertex* d = static_cast<PspUIVertex*>(dst);
+        for (uint32_t i = 0; i < numVerts; ++i)
+        {
+            d[i].u = s[i].u * uScale;
+            d[i].v = s[i].v * vScale;
+            d[i].x = s[i].x;
+            d[i].y = s[i].y;
+            d[i].z = s[i].z;
+
+            // engine packs R in low byte (verified Phase 2)
+            const uint32_t c = s[i].color;
+            const uint8_t r8 = (uint8_t)(((c >>  0) & 0xFF) * tr);
+            const uint8_t g8 = (uint8_t)(((c >>  8) & 0xFF) * tg);
+            const uint8_t b8 = (uint8_t)(((c >> 16) & 0xFF) * tb);
+            const uint8_t a8 = (uint8_t)(((c >> 24) & 0xFF) * ta);
+            d[i].color = ((uint32_t)a8 << 24) | ((uint32_t)b8 << 16) |
+                         ((uint32_t)g8 <<  8) |  (uint32_t)r8;
+        }
+        sceKernelDcacheWritebackRange(dst, bytes);
+        return dst;
+    }
+
     // Per-widget upload helper used by Quad / Text / Poly. Repacks engine
     // VertexUI into PSP layout, ensures the dest buffer is large enough,
     // and flushes dcache so the GE sees the new bytes.
@@ -404,10 +478,29 @@ namespace
         sceKernelDcacheWritebackRange(dst, bytes);
     }
 
+    // Map engine FilterType -> PSP GU filter constant. PSP only exposes
+    // NEAREST and LINEAR (no separate min/mag/mipmap variants in this build).
+    int FilterToGu(FilterType ft)
+    {
+        return (ft == FilterType::Nearest) ? GU_NEAREST : GU_LINEAR;
+    }
+
+    // Map engine WrapMode -> PSP GU wrap constant. PSP has only CLAMP and
+    // REPEAT — Mirror falls back to REPEAT (closest behavioural neighbour;
+    // a true mirror would need CPU-side UV flipping).
+    int WrapToGu(WrapMode wm)
+    {
+        return (wm == WrapMode::Clamp) ? GU_CLAMP : GU_REPEAT;
+    }
+
     // Bind a UI texture (Quad's texture, font atlas, etc) with sensible
     // defaults for screen-space alpha-blended UI. Falls back to white when
     // null. Uses GU_TFX_MODULATE + GU_TCC_RGBA so per-vertex colour and
     // alpha both apply.
+    //
+    // Note: per-texel UV scaling for TRANSFORM_2D ("through") mode happens
+    // in ApplyUIDrawTransform — sceGuTexScale doesn't apply in through mode
+    // so the multiply has to be baked into the vertex buffer.
     void BindUITexture(Texture* tex)
     {
         if (tex == nullptr || tex->GetResource() == nullptr ||
@@ -428,8 +521,8 @@ namespace
         sceGuTexMode(r->mPsm, 0, 0, r->mSwizzled);
         sceGuTexImage(0, (int)r->mWidth, (int)r->mHeight, (int)r->mBufWidth, r->mPixels);
         sceGuTexFunc(GU_TFX_MODULATE, GU_TCC_RGBA);
-        sceGuTexFilter(GU_LINEAR, GU_LINEAR);
-        sceGuTexWrap(GU_CLAMP, GU_CLAMP);
+        sceGuTexFilter(FilterToGu(tex->GetFilterType()), FilterToGu(tex->GetFilterType()));
+        sceGuTexWrap(WrapToGu(tex->GetWrapMode()), WrapToGu(tex->GetWrapMode()));
         sceGuTexScale(1.0f, 1.0f);
         sceGuTexOffset(0.0f, 0.0f);
         sceGuSetMatrix(GU_TEXTURE, &sIdentityMtx);
@@ -483,8 +576,11 @@ namespace
         sceGuTexMode(r->mPsm, /*maxMips=*/0, /*a2=*/0, /*swizzle=*/r->mSwizzled);
         sceGuTexImage(0, (int)r->mWidth, (int)r->mHeight, (int)r->mBufWidth, r->mPixels);
         sceGuTexFunc(GU_TFX_MODULATE, GU_TCC_RGBA);
-        sceGuTexFilter(GU_LINEAR, GU_LINEAR);
-        sceGuTexWrap(GU_REPEAT, GU_REPEAT);
+        // Honour the texture asset's filter + wrap mode (see BindUITexture
+        // comment — same hardcoding bug affected 3D meshes; cube material
+        // marked Nearest was bleeding into smooth gradients).
+        sceGuTexFilter(FilterToGu(tex->GetFilterType()), FilterToGu(tex->GetFilterType()));
+        sceGuTexWrap(WrapToGu(tex->GetWrapMode()), WrapToGu(tex->GetWrapMode()));
         sceGuEnable(GU_TEXTURE_2D);
     }
 }
@@ -983,11 +1079,42 @@ void GFX_UpdateQuadResourceVertexData(Quad* quad)
                      quad->GetVertices(), quad->GetNumVertices());
 }
 
-void GFX_DrawQuad(Quad* /*quad*/)
+void GFX_DrawQuad(Quad* quad)
 {
-    // Deferred to Phase 4. Re-enabling produces a full-screen green overlay
-    // from some engine-internal widget that fires Quad/Text draws even when
-    // the user's scene has no real widget nodes. Investigate in Phase 4.
+    if (quad == nullptr) return;
+    QuadResource* r = quad->GetResource();
+    if (r == nullptr || r->mVertexData == nullptr) return;
+    const uint32_t n = quad->GetNumVertices();
+    if (n == 0) return;
+
+    // [UIDBG] temp instrumentation — track down the phantom fullscreen green
+    // overlay. Strip once identified.
+    static int sQuadDbg = 0;
+    if (sQuadDbg < 8)
+    {
+        Texture* tex = quad->GetTexture();
+        const VertexUI* verts = quad->GetVertices();
+        LogDebug("[UIDBG] DrawQuad name='%s' n=%u tex=%s v0=(%.1f,%.1f) v0.col=0x%08X widgetColor=(%.2f,%.2f,%.2f,%.2f)",
+                 quad->GetName().c_str(), n,
+                 tex != nullptr ? tex->GetName().c_str() : "<null>",
+                 verts ? verts[0].mPosition.x : 0.0f,
+                 verts ? verts[0].mPosition.y : 0.0f,
+                 verts ? verts[0].mColor : 0u,
+                 quad->GetColor().r, quad->GetColor().g, quad->GetColor().b, quad->GetColor().a);
+        ++sQuadDbg;
+    }
+
+    void* drawBuf = ApplyUIDrawTransform(r->mVertexData, n, quad->GetColor(), quad->GetTexture());
+    if (drawBuf == nullptr) return;   // tint alpha = 0
+
+    SetupUIPipeline();
+    BindUITexture(quad->GetTexture());
+
+    if (drawBuf == r->mVertexData)
+    {
+        sceKernelDcacheWritebackRange(r->mVertexData, r->mVertexCapacity);
+    }
+    sceGuDrawArray(GU_TRIANGLE_FAN, kUIVertexFlags, (int)n, nullptr, drawBuf);
 }
 
 void GFX_CreateQuadBorderResource(Quad* quad)
@@ -1017,7 +1144,38 @@ void GFX_UpdateQuadBorderResourceVertexData(Quad* quad)
                      quad->GetBorderVertices(), quad->GetBorderNumVertices());
 }
 
-void GFX_DrawQuadBorder(Quad* /*quad*/) {}   // Deferred to Phase 4.
+void GFX_DrawQuadBorder(Quad* quad)
+{
+    if (quad == nullptr) return;
+    QuadResource* r = quad->GetBorderResource();
+    if (r == nullptr || r->mVertexData == nullptr) return;
+    const uint32_t n = quad->GetBorderNumVertices();
+    if (n == 0) return;
+
+    static int sBorderDbg = 0;
+    if (sBorderDbg < 4)
+    {
+        LogDebug("[UIDBG] DrawQuadBorder name='%s' n=%u borderColor=(%.2f,%.2f,%.2f,%.2f)",
+                 quad->GetName().c_str(), n,
+                 quad->GetBorderColor().r, quad->GetBorderColor().g,
+                 quad->GetBorderColor().b, quad->GetBorderColor().a);
+        ++sBorderDbg;
+    }
+
+    // Border uses GetBorderColor() as the uniform tint, not GetColor().
+    // No texture (white fallback in BindUITexture), so pass nullptr.
+    void* drawBuf = ApplyUIDrawTransform(r->mVertexData, n, quad->GetBorderColor(), nullptr);
+    if (drawBuf == nullptr) return;
+
+    SetupUIPipeline();
+    BindUITexture(nullptr); // solid border fill against the built-in white texel
+
+    if (drawBuf == r->mVertexData)
+    {
+        sceKernelDcacheWritebackRange(r->mVertexData, r->mVertexCapacity);
+    }
+    sceGuDrawArray(GU_TRIANGLE_FAN, kUIVertexFlags, (int)n, nullptr, drawBuf);
+}
 
 // ---- Text -------------------------------------------------------------------
 
@@ -1067,7 +1225,43 @@ void GFX_UpdateTextResourceVertexData(Text* text)
     sceKernelDcacheWritebackRange(r->mVertexData, bytes);
 }
 
-void GFX_DrawText(Text* /*text*/) {}   // Deferred to Phase 4.
+void GFX_DrawText(Text* text)
+{
+    if (text == nullptr) return;
+    TextResource* r = text->GetResource();
+    if (r == nullptr || r->mVertexData == nullptr) return;
+
+    Font* font = text->GetFont();
+    if (font == nullptr) return;
+    Texture* fontTex = font->GetTexture();
+    if (fontTex == nullptr) return;
+
+    const uint32_t numVisible = text->GetNumVisibleCharacters();
+    if (numVisible == 0) return;
+    const uint32_t numVerts = numVisible * TEXT_VERTS_PER_CHAR;
+
+    static int sTextDbg = 0;
+    if (sTextDbg < 4)
+    {
+        LogDebug("[UIDBG] DrawText name='%s' text='%s' chars=%u font='%s'",
+                 text->GetName().c_str(),
+                 text->GetText().c_str(), numVisible,
+                 font->GetName().c_str());
+        ++sTextDbg;
+    }
+
+    void* drawBuf = ApplyUIDrawTransform(r->mVertexData, numVerts, text->GetColor(), fontTex);
+    if (drawBuf == nullptr) return;
+
+    SetupUIPipeline();
+    BindUITexture(fontTex);
+
+    if (drawBuf == r->mVertexData)
+    {
+        sceKernelDcacheWritebackRange(r->mVertexData, r->mVertexCapacity);
+    }
+    sceGuDrawArray(GU_TRIANGLES, kUIVertexFlags, (int)numVerts, nullptr, drawBuf);
+}
 
 // ---- Poly -------------------------------------------------------------------
 
@@ -1094,7 +1288,37 @@ void GFX_UpdatePolyResourceVertexData(Poly* poly)
                      poly->GetVertices(), poly->GetNumVertices());
 }
 
-void GFX_DrawPoly(Poly* /*poly*/) {}   // Deferred to Phase 4.
+void GFX_DrawPoly(Poly* poly)
+{
+    if (poly == nullptr) return;
+    PolyResource* r = poly->GetResource();
+    if (r == nullptr || r->mVertexData == nullptr) return;
+    const uint32_t n = poly->GetNumVertices();
+    if (n == 0) return;
+
+    static int sPolyDbg = 0;
+    if (sPolyDbg < 4)
+    {
+        LogDebug("[UIDBG] DrawPoly name='%s' n=%u", poly->GetName().c_str(), n);
+        ++sPolyDbg;
+    }
+
+    // Poly draws as line-strip with the white fallback — no texture sampling.
+    void* drawBuf = ApplyUIDrawTransform(r->mVertexData, n, poly->GetColor(), nullptr);
+    if (drawBuf == nullptr) return;
+
+    SetupUIPipeline();
+    BindUITexture(nullptr);  // Poly is a line strip; texture sampling not meaningful
+
+    if (drawBuf == r->mVertexData)
+    {
+        sceKernelDcacheWritebackRange(r->mVertexData, r->mVertexCapacity);
+    }
+    // Engine Poly maps to LINE_STRIP topology (matches PipelineConfig::Poly in
+    // the Vulkan backend). PSP line thickness is fixed at 1 px — Poly::mLineWidth
+    // is silently ignored.
+    sceGuDrawArray(GU_LINE_STRIP, kUIVertexFlags, (int)n, nullptr, drawBuf);
+}
 
 void GFX_DrawStaticMesh(StaticMesh* /*mesh*/, Material* /*material*/, const glm::mat4& /*transform*/, glm::vec4 /*color*/) {}
 
