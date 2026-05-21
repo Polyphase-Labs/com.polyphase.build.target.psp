@@ -55,6 +55,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <sstream>
 #include <string>
 
 static PolyphaseEngineAPI* sEngineAPI = nullptr;
@@ -408,6 +410,53 @@ namespace
         }
     }
 
+    // Force `WindowWidth=480` / `WindowHeight=272` in a packaged Config.ini.
+    // PSP screen is fixed at 480x272, but the project's `Config.ini` carries
+    // whatever the user authored for desktop (typically 1280x720), and the
+    // engine's `ReadEngineConfig` reads those values at boot, overriding the
+    // runtime's `OctPreInitialize` defaults. Without this rewrite step,
+    // FullStretch widgets compute their rects against a 1280x720 viewport
+    // and PSP's 480x272 scissor crops the result to a tiny corner.
+    //
+    // Strategy: read the file line-by-line, replace any existing
+    // WindowWidth/WindowHeight lines, append them if absent. Other lines pass
+    // through unchanged so the user's other settings (Logging, ColorScale,
+    // etc.) are preserved.
+    void ForcePspWindowSizeInConfig(const std::string& configPath)
+    {
+        std::ifstream in(configPath);
+        if (!in.is_open()) return;
+
+        std::ostringstream out;
+        std::string line;
+        bool sawW = false;
+        bool sawH = false;
+        while (std::getline(in, line))
+        {
+            if (line.rfind("WindowWidth=", 0) == 0)
+            {
+                out << "WindowWidth=480\n";
+                sawW = true;
+            }
+            else if (line.rfind("WindowHeight=", 0) == 0)
+            {
+                out << "WindowHeight=272\n";
+                sawH = true;
+            }
+            else
+            {
+                out << line << "\n";
+            }
+        }
+        in.close();
+
+        if (!sawW) out << "WindowWidth=480\n";
+        if (!sawH) out << "WindowHeight=272\n";
+
+        std::ofstream o(configPath, std::ios::trunc);
+        if (o.is_open()) o << out.str();
+    }
+
     int32_t Psp_PostPackage(const PolyphaseBuildContext* ctx)
     {
         if (ctx == nullptr || ctx->packageOutputDir == nullptr || ctx->projectName == nullptr) return 0;
@@ -434,6 +483,19 @@ namespace
         const std::string elfPath  = outDir + "/" + ctx->projectName + ".elf";
         const std::string sfoPath  = outDir + "/PARAM.SFO";
         const std::string ebootPath = outDir + "/EBOOT.PBP";
+
+        // Rewrite both packaged Config.ini copies (root + projectName/) so the
+        // PSP runtime always boots with the native 480x272 logical viewport.
+        // Project Config.ini carries the desktop window size (typically
+        // 1280x720) which ReadEngineConfig would otherwise reload at boot,
+        // overriding the OctPreInitialize defaults. Override is silent and
+        // non-configurable — PSP has only one screen size.
+        ForcePspWindowSizeInConfig(outDir + "/Config.ini");
+        ForcePspWindowSizeInConfig(outDir + "/" + std::string(ctx->projectName) + "/Config.ini");
+        if (ctx->Log != nullptr)
+        {
+            ctx->Log(POLYPHASE_BT_LOG_DEBUG, "Patched WindowWidth/Height to 480/272 in packaged Config.ini");
+        }
 
         // (1) Generate PARAM.SFO. PSP firmware refuses to load PBPs without
         //     a valid one, so a failure here aborts the package step.
