@@ -141,10 +141,13 @@ VRAM allocation in this addon (fixed at boot):
 | Threads, mutexes, timers | ✅ | `sceKernel*` — binary semaphore for mutex |
 | Logging | ✅ | `stdout` + `ms0:/PSP/GAME/POLYPHASE/polyphase.log` |
 | **Textured static meshes** | ✅ | Phase 2 — 32-byte vertex, RGBA8 linear textures |
-| Lit / shaded meshes | ⚠️ Stub | Phase 3 — `sceGuLight` up to 4 lights, vertex lighting |
-| Skeletal meshes (skinning) | ⚠️ Stub | Phase 3 — HW 8 bones or CPU skin fallback |
-| Translucency / blending | ⚠️ Stub | Phase 3 — wired but vertex-color path needed |
-| UI / widgets / text | ⚠️ Stub | Phase 4 — `GU_TRANSFORM_2D` quad pipeline |
+| **Lit / shaded meshes** | ✅ | Phase 3 — `sceGuLight0..3` HW vertex lighting + `sceGuAmbient` from `World::GetAmbientLightColor` |
+| **Per-material shading** | ✅ | Phase 3 — Lit / Unlit / Toon (Toon falls back to Lit until LUT support) |
+| **Translucency + blend modes** | ✅ | Phase 3 — Opaque / Masked (alpha-test) / Translucent (src*α + dst*(1-α)) / Additive (src*α + dst) |
+| **Back-face culling** | ✅ | Phase 3 — CCW front-face (matches 3DS port); per-material override via `MaterialLite::GetCullMode()` |
+| 2D UI — Quad / Text / Poly | ⚠️ Stub (deferred to Phase 4) | Resources allocate + repack correctly but Draw paths are no-op'd. Re-enabling produces a fullscreen green overlay from an engine-internal widget that fires `GFX_DrawQuad/Text/Poly` even when the user's scene has no real widgets. Needs engine-side investigation in Phase 4. |
+| Skeletal meshes (skinning) | ⚠️ Stub | Phase 3.5 — HW 8 bones via `GU_WEIGHT_32BITF` or CPU skin fallback |
+| Widget rotation | ⚠️ Skipped | `GU_TRANSFORM_2D` has no matrix slot — needs CPU pre-rotation pass; V1 ignores rotation on Text/Quad |
 | Audio | ⚠️ Stub | Phase 5 — `sceAudio` 8-channel mixing |
 | Input | ⚠️ Stub | Phase 5 — `sceCtrlReadBufferPositive` |
 | Network | ⚠️ Stub | Deferred — `sceNetAdhoc` requires WLAN handshake |

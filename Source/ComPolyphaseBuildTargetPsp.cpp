@@ -323,7 +323,19 @@ namespace
         char jobsArg[16];
         std::snprintf(jobsArg, sizeof(jobsArg), " -j%d", jobs);
 
+        // Force Rebuild: prepend `rm -f *.o *.d *.elf` so the next make starts
+        // from zero objects. Necessary because PSPSDK's build.mak emits no .d
+        // dep files, so header-only changes never invalidate stale .o's.
+        std::string cleanPrefix;
+        if (ctx->forceRebuild)
+        {
+            cleanPrefix =
+                "(cd " + ShellPath(ctx->projectDir) +
+                " && rm -f *.o *.d *.elf Build/PSP/*.elf 2>/dev/null; true) && ";
+        }
+
         const std::string body =
+            cleanPrefix +
             "make -C " + ShellPath(ctx->projectDir) +
             " -f " + ShellPath(makefilePath) +
             makePspDev + makePolyphasePath + jobsArg;
