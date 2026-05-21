@@ -141,7 +141,18 @@ INCDIR = \
 CPPFILES := $(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.cpp)))
 CFILES   := $(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.c)))
 
-VPATH := $(SOURCES)
+# Pull in only the embedded-scripts blob from Generated/. EmbeddedAssets.cpp
+# in that same dir holds ~28 MB of cooked asset bytes that would balloon the
+# .elf past PSP's 32 MB RAM ceiling — we deliberately exclude it. PSP loads
+# assets from disk via AssetManager::Discover, so the embedded asset table
+# isn't needed at runtime anyway. Scripts, however, only ship via the
+# embedded path (the cooker doesn't copy Scripts/ to disk for the package),
+# so this one file IS needed for Lua-attached components to actually run.
+ifneq ($(wildcard Generated/EmbeddedScripts.cpp),)
+CPPFILES += EmbeddedScripts.cpp
+endif
+
+VPATH := $(SOURCES) Generated
 OBJS  := $(CPPFILES:.cpp=.o) $(CFILES:.c=.o)
 
 # ---- Flags ------------------------------------------------------------------
