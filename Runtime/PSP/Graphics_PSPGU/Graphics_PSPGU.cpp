@@ -383,9 +383,10 @@ namespace
     }
 
     // Returns the buffer the GE should draw from after applying the widget's
-    // uniform tint AND scaling normalised UVs to PSP texel units.
+    // uniform tint, scaling normalised UVs to PSP texel units, and optionally
+    // baking a per-vertex position scale+translate.
     //
-    // Two transforms baked into one scratch pass:
+    // Three transforms baked into one scratch pass:
     //
     //   (1) Tint. Vulkan/GX apply widget uniform colour in a shader / TEV
     //       stage; PSP has no shader and only one TEV stage (sceGuTexFunc),
@@ -395,13 +396,23 @@ namespace
     //       interprets float texcoords as TEXEL coords, NOT normalised
     //       0..1 like 3D mode. sceGuTexScale doesn't apply in through mode,
     //       so we have to bake the multiply into the vertices: each UV gets
-    //       multiplied by the bound texture's width/height. Without this,
-    //       a widget UV=(0..1) samples one texel and shows up as a single-
-    //       colour smear (the user-visible "fullscreen green wash" bug).
+    //       multiplied by the bound texture's width/height.
+    //
+    //   (3) Position transform: vertex.xy = vertex.xy * posScale + posOffset.
+    //       Quad/Poly emit screen-space-pixel vertices already (posScale=1,
+    //       posOffset=0 is the right no-op). Text emits font-native-pixel,
+    //       widget-local vertices (cursor starts at 0,0 in local space at
+    //       font's native point size) — Vulkan's text shader bakes
+    //       posOffset=(rect.mX + justifiedOffset, rect.mY + justifiedOffset)
+    //       and posScale=(scaledTextSize / fontSize) into a uniform. PSP has
+    //       no shader; bake the same multiply+translate into the vertex
+    //       buffer here.
     //
     // Returns nullptr to signal "skip the draw" when alpha rounds to 0.
     void* ApplyUIDrawTransform(const void* srcBuf, uint32_t numVerts,
-                               const glm::vec4& tint, Texture* tex)
+                               const glm::vec4& tint, Texture* tex,
+                               glm::vec2 posScale = glm::vec2(1.0f, 1.0f),
+                               glm::vec2 posOffset = glm::vec2(0.0f, 0.0f))
     {
         if (srcBuf == nullptr || numVerts == 0) return nullptr;
 
@@ -439,8 +450,8 @@ namespace
         {
             d[i].u = s[i].u * uScale;
             d[i].v = s[i].v * vScale;
-            d[i].x = s[i].x;
-            d[i].y = s[i].y;
+            d[i].x = s[i].x * posScale.x + posOffset.x;
+            d[i].y = s[i].y * posScale.y + posOffset.y;
             d[i].z = s[i].z;
 
             // engine packs R in low byte (verified Phase 2)
@@ -1250,7 +1261,25 @@ void GFX_DrawText(Text* text)
         ++sTextDbg;
     }
 
-    void* drawBuf = ApplyUIDrawTransform(r->mVertexData, numVerts, text->GetColor(), fontTex);
+    // Text vertices are widget-LOCAL and at the font's native point size
+    // (cursor starts at 0,0 at fontSize point size). Vulkan/GX apply
+    // (rect.x + justifiedOffset, rect.y + justifiedOffset) translation and
+    // (scaledTextSize / fontSize) scale via shader/TEV uniform. PSP has
+    // neither, so we bake the same transform into the vertex buffer here —
+    // otherwise every Text widget renders at top-left at font-native size
+    // regardless of its anchor.
+    Font* fontAsset = text->GetFont();
+    const int32_t fontSize = fontAsset ? fontAsset->GetSize() : 32;
+    const float textScale = (fontSize > 0)
+        ? (text->GetScaledTextSize() / (float)fontSize) : 1.0f;
+    const Rect rect = text->GetRect();
+    const glm::vec2 justified = text->GetJustifiedOffset();
+    const glm::vec2 posScale(textScale, textScale);
+    const glm::vec2 posOffset(rect.mX + justified.x, rect.mY + justified.y);
+
+    void* drawBuf = ApplyUIDrawTransform(r->mVertexData, numVerts,
+                                         text->GetColor(), fontTex,
+                                         posScale, posOffset);
     if (drawBuf == nullptr) return;
 
     SetupUIPipeline();
