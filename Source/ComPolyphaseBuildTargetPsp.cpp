@@ -478,9 +478,71 @@ namespace
         if (o.is_open()) o << out.str();
     }
 
+    // Copy a single file using std::ifstream/std::ofstream. Creates the
+    // destination directory tree as needed (via mkdir -p shelled out — keeps
+    // this addon free of <filesystem>, which not all PSPSDK hosts ship).
+    // Returns true on success, false if the source can't be opened. Engine-
+    // wide bundling (cacert.pem, etc.) goes through this from Psp_PostPackage.
+    bool PspCopyFile(const std::string& srcPath, const std::string& dstPath)
+    {
+        std::ifstream in(srcPath, std::ios::binary);
+        if (!in.is_open()) return false;
+
+        // Carve the parent dir for dstPath. shell `mkdir -p` handles missing
+        // intermediates. ShellPath quotes for spaces. Errors bubble through
+        // as the subsequent ofstream open failing.
+        const size_t lastSlash = dstPath.find_last_of("/\\");
+        if (lastSlash != std::string::npos)
+        {
+            const std::string parent = dstPath.substr(0, lastSlash);
+            const std::string mk = std::string("mkdir -p ") + ShellPath(parent);
+            std::system(mk.c_str());
+        }
+
+        std::ofstream out(dstPath, std::ios::binary | std::ios::trunc);
+        if (!out.is_open()) return false;
+        out << in.rdbuf();
+        return out.good();
+    }
+
+    // Ship the Mozilla CA bundle into the package so HttpBackend_PSP can
+    // load it at runtime via Stream::ReadFile("Engine/CACerts/cacert.pem").
+    // Without this the PSP runtime warns + falls back to verify=none for
+    // every HTTPS request. Source lives in <engineDir>/External/CACerts/.
+    void StageCaBundle(const PolyphaseBuildContext* ctx)
+    {
+        if (ctx == nullptr || ctx->engineDir == nullptr || ctx->packageOutputDir == nullptr) return;
+
+        const std::string src = std::string(ctx->engineDir) + "/External/CACerts/cacert.pem";
+        const std::string dst = std::string(ctx->packageOutputDir) + "/Engine/CACerts/cacert.pem";
+        if (!PspCopyFile(src, dst))
+        {
+            if (ctx->Log != nullptr)
+            {
+                char msg[512];
+                std::snprintf(msg, sizeof(msg),
+                    "PSP: CA bundle copy failed (src=%s). HTTPS will run "
+                    "without peer verification.", src.c_str());
+                ctx->Log(POLYPHASE_BT_LOG_DEBUG, msg);
+            }
+            return;
+        }
+        if (ctx->Log != nullptr)
+        {
+            char msg[512];
+            std::snprintf(msg, sizeof(msg),
+                "PSP: staged CA bundle -> %s", dst.c_str());
+            ctx->Log(POLYPHASE_BT_LOG_DEBUG, msg);
+        }
+    }
+
     int32_t Psp_PostPackage(const PolyphaseBuildContext* ctx)
     {
         if (ctx == nullptr || ctx->packageOutputDir == nullptr || ctx->projectName == nullptr) return 0;
+
+        // Drop the Mozilla CA bundle in alongside the engine assets.
+        // HttpBackend_PSP.cpp loads it at runtime to verify HTTPS peers.
+        StageCaBundle(ctx);
 
         const std::string title    = ReadOption(ctx, kTitleKey,    kTitleDefault);
         const std::string discId   = ReadOption(ctx, kDiscIdKey,   kDiscIdDefault);

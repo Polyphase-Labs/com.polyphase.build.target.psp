@@ -41,6 +41,7 @@
 #include "Engine/Nodes/3D/StaticMesh3d.h"
 #include "Engine/Nodes/3D/SkeletalMesh3d.h"
 #include "Engine/Nodes/3D/InstancedMesh3d.h"
+#include "Engine/Nodes/3D/Particle3d.h"
 #include "Engine/Nodes/3D/Camera3d.h"
 #include "Engine/Nodes/Widgets/Widget.h"
 #include "Engine/Nodes/Widgets/Quad.h"
@@ -912,37 +913,71 @@ void GFX_CreateTextureResource(Texture* texture, std::vector<uint8_t>& /*data*/)
     const std::vector<uint8_t>& pixels = texture->GetPixels();
     if (pixels.empty()) return;
 
-    // PSP texture pitch must be a multiple of 16 pixels (= 64 bytes at RGBA8).
-    const uint32_t bufW = (srcW + 15u) & ~15u;
-    const uint32_t bytes = bufW * srcH * 4u;
+    // PSP sampler requires power-of-two width/height for the dims passed to
+    // sceGuTexImage — non-POT dims get HW-clamped down to the next-lower
+    // POT (so a 256x144 video texture binds as 256x128 and the bottom 16
+    // rows are unsampleable). Pad both axes UP to next POT, copy source
+    // pixels into the top-left of the padded buffer, and tell the engine
+    // the visible region via Texture::SetUVMax so the Quad widget
+    // multiplies its UVs and stops sampling at the content edge. Same
+    // pattern Wii/GX uses for its non-multiple-of-4 streaming textures
+    // (Graphics_GX.cpp ~390). bufWidth must additionally be a multiple of
+    // 16 pixels (= 64 B stride at RGBA8); POT widths ≥ 16 satisfy this
+    // trivially.
+    auto nextPow2 = [](uint32_t v) -> uint32_t {
+        if (v <= 1u) return 1u;
+        --v;
+        v |= v >> 1; v |= v >> 2; v |= v >> 4; v |= v >> 8; v |= v >> 16;
+        return v + 1u;
+    };
+    uint32_t potW = nextPow2(srcW);
+    uint32_t potH = nextPow2(srcH);
+    if (potW < 16u) potW = 16u;
+    const uint32_t bufW  = potW;
+    const uint32_t bytes = bufW * potH * 4u;
 
     void* dst = memalign(16, bytes);
     if (dst == nullptr) return;
 
-    if (bufW == srcW)
+    // Copy source rows into top-left of the padded buffer; replicate the
+    // last source column/row into the right/bottom padding so linear
+    // filtering near the content edge doesn't blend into garbage. UVMax
+    // (set below) means the padding bands aren't normally sampled at all
+    // — the edge-replication is a belt-and-braces safety for off-by-one
+    // texel sampling.
     {
-        memcpy(dst, pixels.data(), bytes);
-    }
-    else
-    {
-        // Row-by-row copy with right-edge padding (replicate last column —
-        // anything is fine since UVs ≤ 1 won't sample padding).
         const uint8_t* src = pixels.data();
         uint8_t* d = (uint8_t*)dst;
         for (uint32_t y = 0; y < srcH; ++y)
         {
             memcpy(d + y * bufW * 4, src + y * srcW * 4, srcW * 4);
-            // pad
-            for (uint32_t x = srcW; x < bufW; ++x)
+            if (srcW < bufW)
             {
-                memcpy(d + y * bufW * 4 + x * 4, d + y * bufW * 4 + (srcW - 1) * 4, 4);
+                const uint32_t lastPx = *reinterpret_cast<const uint32_t*>(d + y * bufW * 4 + (srcW - 1) * 4);
+                uint32_t* dpad = reinterpret_cast<uint32_t*>(d + y * bufW * 4 + srcW * 4);
+                for (uint32_t x = srcW; x < bufW; ++x) *dpad++ = lastPx;
             }
+        }
+        if (srcH < potH)
+        {
+            const uint8_t* lastRow = (uint8_t*)dst + (srcH - 1) * bufW * 4;
+            for (uint32_t y = srcH; y < potH; ++y)
+                memcpy((uint8_t*)dst + y * bufW * 4, lastRow, bufW * 4);
         }
     }
 
+    // Tell the engine the visible sub-rect of the POT buffer so the Quad
+    // widget (and any 3D mesh sampling this texture) crops UVs to the
+    // content region. Without this the renderer assumes UV (0..1) maps to
+    // the full physical extent — content gets letterboxed into the upper-
+    // left of the visible area, OR (since most 3D meshes ignore UVMax and
+    // just sample 0..1) the padding bands become visible as black strips.
+    texture->SetUVMax(glm::vec2(float(srcW) / float(bufW),
+                                float(srcH) / float(potH)));
+
     r->mPixels   = dst;
-    r->mWidth    = srcW;
-    r->mHeight   = srcH;
+    r->mWidth    = bufW;   // PSP HW samples up to mWidth × mHeight — must be POT
+    r->mHeight   = potH;
     r->mBufWidth = bufW;
     r->mPsm      = GU_PSM_8888;
     r->mMipCount = 0;
@@ -984,9 +1019,63 @@ void GFX_DestroyTextureResource(Texture* texture)
     r->mWidth = r->mHeight = r->mBufWidth = 0;
 }
 
-void GFX_UpdateTextureResourcePixels(Texture* /*texture*/, const uint8_t* /*src*/, uint32_t /*srcWidth*/, uint32_t /*srcHeight*/)
+void GFX_UpdateTextureResourcePixels(Texture* texture, const uint8_t* src,
+                                     uint32_t srcWidth, uint32_t srcHeight)
 {
-    // Streaming textures (video player) — not wired in Phase 2.
+    // Streaming texture upload — used by the VideoPlayer addon to push each
+    // decoded video frame into the existing texture's GPU buffer. Same
+    // RGBA8 layout + 16-pixel pitch alignment as GFX_CreateTextureResource;
+    // we just skip the (re)allocation and copy into the existing slot.
+    //
+    // The decoder always submits frames at the texture's authored
+    // dimensions, but the caller's `srcWidth/srcHeight` could differ if a
+    // codec returned an off-by-one frame, so we clip to whichever is
+    // smaller. Any unwritten rows just keep their previous frame's pixels
+    // — better than leaving them as garbage / black slits.
+    if (texture == nullptr || src == nullptr || srcWidth == 0 || srcHeight == 0) return;
+    TextureResource* r = texture->GetResource();
+    if (r == nullptr || r->mPixels == nullptr) return;
+    if (r->mWidth == 0 || r->mHeight == 0 || r->mBufWidth == 0) return;
+
+    const uint32_t copyW = (srcWidth  < r->mWidth)  ? srcWidth  : r->mWidth;
+    const uint32_t copyH = (srcHeight < r->mHeight) ? srcHeight : r->mHeight;
+    const uint32_t dstStrideBytes = r->mBufWidth * 4u;
+    const uint32_t srcStrideBytes = srcWidth     * 4u;
+
+    uint8_t* dst = static_cast<uint8_t*>(r->mPixels);
+
+    if (copyW == r->mWidth && copyW == srcWidth && dstStrideBytes == srcStrideBytes)
+    {
+        // Fast path — strides match (bufW == srcW), single contiguous copy.
+        memcpy(dst, src, copyH * dstStrideBytes);
+    }
+    else
+    {
+        // Row-by-row: src has tight srcWidth pitch, dst has padded mBufWidth.
+        // Pad the right edge by replicating the last copied pixel — UVs at or
+        // below 1.0 won't sample padding anyway, and any value beats stale
+        // data from the previous frame leaking through filtering.
+        for (uint32_t y = 0; y < copyH; ++y)
+        {
+            uint8_t*       drow = dst + y * dstStrideBytes;
+            const uint8_t* srow = src + y * srcStrideBytes;
+            memcpy(drow, srow, copyW * 4u);
+            if (copyW < r->mBufWidth)
+            {
+                const uint32_t lastPx = *reinterpret_cast<const uint32_t*>(drow + (copyW - 1) * 4u);
+                uint32_t* dpad = reinterpret_cast<uint32_t*>(drow + copyW * 4u);
+                for (uint32_t x = copyW; x < r->mBufWidth; ++x)
+                {
+                    *dpad++ = lastPx;
+                }
+            }
+        }
+    }
+
+    // GE samples textures via DMA — flush CPU dcache for the rows we just
+    // touched so the next BindTexture sees fresh pixels, not whatever was
+    // cached from the previous frame.
+    sceKernelDcacheWritebackRange(dst, copyH * dstStrideBytes);
 }
 
 // =============================================================================
@@ -1377,10 +1466,119 @@ void GFX_DestroyTileMap2DResource(TileMap2D* /*t*/) {}
 void GFX_UpdateTileMap2DResource(TileMap2D* /*t*/, const std::vector<VertexColor>& /*v*/, const std::vector<IndexType>& /*i*/) {}
 void GFX_DrawTileMap2D(TileMap2D* /*t*/) {}
 
-void GFX_CreateParticleCompResource(Particle3D* /*c*/) {}
-void GFX_DestroyParticleCompResource(Particle3D* /*c*/) {}
-void GFX_UpdateParticleCompVertexBuffer(Particle3D* /*c*/, const std::vector<VertexParticle>& /*v*/) {}
-void GFX_DrawParticleComp(Particle3D* /*c*/) {}
+// =============================================================================
+// Particles
+//
+// Engine simulates particles CPU-side and produces a std::vector<VertexParticle>
+// with 4 corner verts per particle (billboard quad). Our job each frame:
+//   1. Reallocate per-comp PSP vertex buffer to fit 6 verts/particle (after
+//      4→6 triangle expansion).
+//   2. Repack engine vertex layout (pos / uv / color) into PSP HW order
+//      (tex / color / pos) AND expand each quad to two triangles in the
+//      same `(0,1,2)(2,1,3)` order GameCube + Vulkan use.
+//   3. Draw with the particle's material — typically unlit + additive or
+//      alpha blend; BindMaterial reads those off the material asset.
+//
+// useLocalSpace toggle: when true, particles are positioned relative to the
+// component's transform (moving the emitter drags the particles with it).
+// When false (default), particles are spawned in world space (emitter
+// position becomes their spawn origin, motion is independent). Matches
+// Vulkan / GameCube behaviour.
+// =============================================================================
+
+void GFX_CreateParticleCompResource(Particle3D* /*c*/)
+{
+    // No-op — buffer allocated lazily on first UpdateVertexBuffer call when
+    // we know the particle count. ParticleCompResource fields default-init
+    // to nullptr / 0 which is the correct "not yet allocated" state.
+}
+
+void GFX_DestroyParticleCompResource(Particle3D* c)
+{
+    if (c == nullptr) return;
+    ParticleCompResource* r = c->GetResource();
+    if (r == nullptr) return;
+    if (r->mVertexData != nullptr) { free(r->mVertexData); r->mVertexData = nullptr; }
+    r->mVertexCapacity = 0;
+    r->mNumVertices    = 0;
+    r->mVertexStride   = 0;
+}
+
+void GFX_UpdateParticleCompVertexBuffer(Particle3D* c, const std::vector<VertexParticle>& vertices)
+{
+    if (c == nullptr) return;
+    ParticleCompResource* r = c->GetResource();
+    if (r == nullptr) return;
+
+    const uint32_t numInputVerts = (uint32_t)vertices.size();
+    const uint32_t numParticles  = numInputVerts / 4;        // engine emits 4 verts/particle
+    const uint32_t numOutVerts   = numParticles * 6;         // expand to triangle list
+    if (numParticles == 0)
+    {
+        r->mNumVertices = 0;
+        return;
+    }
+
+    const uint32_t stride = sizeof(psp::ParticleVertex);
+    const uint32_t needed = stride * numOutVerts;
+
+    // Grow on overflow only — keeps the buffer stable when particle count
+    // oscillates frame-to-frame.
+    if (r->mVertexCapacity < needed || r->mVertexData == nullptr)
+    {
+        if (r->mVertexData != nullptr) { free(r->mVertexData); r->mVertexData = nullptr; }
+        r->mVertexData     = memalign(16, needed);
+        r->mVertexCapacity = (r->mVertexData != nullptr) ? needed : 0;
+        if (r->mVertexData == nullptr) { r->mNumVertices = 0; return; }
+    }
+
+    psp::RepackParticleVertices(vertices.data(), numParticles,
+                                static_cast<psp::ParticleVertex*>(r->mVertexData));
+    r->mNumVertices  = numOutVerts;
+    r->mVertexStride = stride;
+
+    sceKernelDcacheWritebackRange(r->mVertexData, needed);
+}
+
+void GFX_DrawParticleComp(Particle3D* c)
+{
+    if (!sGuInitialised || c == nullptr) return;
+    if (c->GetNumParticles() == 0) return;
+
+    ParticleCompResource* r = c->GetResource();
+    if (r == nullptr || r->mVertexData == nullptr || r->mNumVertices == 0) return;
+
+    // Material: read off the comp, fall back to renderer default. Particles
+    // modulate the texture by per-vertex colour so useVertexColor=true.
+    Material* matBase = c->GetMaterial();
+    MaterialLite* mat = Material::AsLite(matBase ? matBase : Renderer::Get()->GetDefaultMaterial());
+    BindMaterial(mat, /*useVertexColor=*/true);
+    BindTexture(mat ? mat->GetTexture(0) : nullptr);
+
+    // World matrix: identity for world-space particles (they live in world
+    // coords already), comp's transform for local-space particles
+    // (they're authored in the comp's local frame and follow the emitter).
+    // Particle3D doesn't have GetRenderTransform — uses GetTransform from
+    // its Node3D base. Same behaviour as GameCube's GFX_DrawParticleComp.
+    ScePspFMatrix4 worldMtx;
+    if (c->GetUseLocalSpace())
+    {
+        const glm::mat4 world = c->GetTransform();
+        memcpy(&worldMtx, &world[0][0], sizeof(float) * 16);
+    }
+    else
+    {
+        const glm::mat4 ident(1.0f);
+        memcpy(&worldMtx, &ident[0][0], sizeof(float) * 16);
+    }
+    sceGuSetMatrix(GU_MODEL, &worldMtx);
+
+    sceGuDrawArray(GU_TRIANGLES,
+                   psp::kParticleVertexFlags,
+                   (int)r->mNumVertices,
+                   nullptr,                  // no index buffer — verts are already expanded
+                   r->mVertexData);
+}
 
 // =============================================================================
 // UI — Quad / Text / Poly (Phase 3)

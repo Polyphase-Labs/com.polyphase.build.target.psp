@@ -55,6 +55,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <malloc.h>     // memalign — not in <stdlib.h> on PSPSDK's newlib
 
 namespace
 {
@@ -93,7 +94,48 @@ namespace
     };
 
     static PspVoice sVoices[AUDIO_MAX_VOICES];
-    static SceUID   sVoiceLock        = -1;
+
+    // ----- Streaming voice table -------------------------------------------
+    // Streams are for the engine's video-player / similar consumers — caller
+    // submits PCM ahead of time (`AUD_SubmitStreamBuffer`) into a per-stream
+    // ring buffer, mixer drains it at output rate, A/V sync queries
+    // `AUD_GetStreamPlayedSamples` to find the playhead in source samples.
+    //
+    // Absolute frame counters (write/read) instead of byte cursors with wrap
+    // math — much easier to reason about under-runs and overruns:
+    //   writeFrameAbs (uint64) — monotonic count of source frames ever submitted
+    //   readFrameAbs  (double) — fractional source-frame playhead (advanced
+    //                            by `rate` per output frame for resampling)
+    //   available frames = writeFrameAbs - (uint64_t)readFrameAbs
+    //   ring index     = (writeFrameAbs + i) % ringFrameCapacity
+    //
+    // Format support is 16-bit signed PCM (mono / stereo), matching the
+    // Windows path; that's what every engine consumer submits. 8-bit / float
+    // streams would need extra fetch paths — add if a use case shows up.
+    constexpr uint32_t kMaxStreams       = 4;
+    constexpr double   kStreamRingSecs   = 0.5;   // per-stream PCM ring depth
+
+    struct PspStream
+    {
+        bool            inUse         = false;
+        bool            paused        = false;
+        uint32_t        srcSampleRate = 0;
+        uint8_t         numChannels   = 1;
+        uint8_t         bitsPerSample = 16;
+
+        int16_t*        ring          = nullptr;   // frame storage (NULL when not in use)
+        uint32_t        ringFrames    = 0;         // capacity in frames
+        uint64_t        writeFrameAbs = 0;         // monotonic submitted frame count
+        double          readFrameAbs  = 0.0;       // fractional playhead (source frames)
+
+        double          rate          = 1.0;       // srcSampleRate / kOutputRate
+        int32_t         leftVolQ15    = 32768;
+        int32_t         rightVolQ15   = 32768;
+    };
+
+    static PspStream sStreams[kMaxStreams];
+
+    static SceUID   sVoiceLock        = -1;     // guards BOTH sVoices and sStreams
     static SceUID   sMixerThread      = -1;
     static int      sAudioChannel     = -1;
     static volatile bool sMixerRun    = false;
@@ -144,12 +186,32 @@ namespace
         }
     }
 
+    // Fetch one frame from a stream's ring at the given absolute source-frame
+    // index. The caller has already verified `srcFrameAbs < s.writeFrameAbs`,
+    // so there's always valid data to read; no under-run check here.
+    inline void FetchStreamFrame(const PspStream& s, uint64_t srcFrameAbs,
+                                 int32_t& outL, int32_t& outR)
+    {
+        const uint32_t ringIdx = (uint32_t)(srcFrameAbs % s.ringFrames);
+        if (s.numChannels == 2)
+        {
+            outL = s.ring[ringIdx * 2 + 0];
+            outR = s.ring[ringIdx * 2 + 1];
+        }
+        else
+        {
+            const int32_t mono = s.ring[ringIdx];
+            outL = outR = mono;
+        }
+    }
+
     void MixOneBuffer()
     {
         memset(sMixBuffer, 0, sizeof(sMixBuffer));
 
         sceKernelWaitSema(sVoiceLock, 1, nullptr);
 
+        // ----- Voices (one-shot SFX / music) -----
         for (uint32_t vi = 0; vi < AUDIO_MAX_VOICES; ++vi)
         {
             PspVoice& v = sVoices[vi];
@@ -183,6 +245,36 @@ namespace
                 sMixBuffer[f * 2 + 1] += (srcR * v.rightVolQ15) >> 15;
 
                 v.positionFrac += v.rate;
+            }
+        }
+
+        // ----- Streams (video / external PCM feeders) -----
+        for (uint32_t si = 0; si < kMaxStreams; ++si)
+        {
+            PspStream& s = sStreams[si];
+            if (!s.inUse || s.paused || s.ring == nullptr) continue;
+
+            for (int f = 0; f < kFramesPerBuffer; ++f)
+            {
+                const uint64_t srcAbs = (uint64_t)s.readFrameAbs;
+
+                // Under-run: caller hasn't fed enough data yet. Output silence
+                // for the remainder of the buffer (the readFrameAbs cursor
+                // doesn't advance, so when fresh data arrives the playhead is
+                // still where it was). Pause-on-underrun could be added later
+                // for stricter A/V sync; for now drop frames gracefully.
+                if (srcAbs >= s.writeFrameAbs)
+                {
+                    break;
+                }
+
+                int32_t srcL, srcR;
+                FetchStreamFrame(s, srcAbs, srcL, srcR);
+
+                sMixBuffer[f * 2 + 0] += (srcL * s.leftVolQ15)  >> 15;
+                sMixBuffer[f * 2 + 1] += (srcR * s.rightVolQ15) >> 15;
+
+                s.readFrameAbs += s.rate;
             }
         }
 
@@ -293,6 +385,17 @@ void AUD_Shutdown()
         sceAudioChRelease(sAudioChannel);
         sAudioChannel = -1;
     }
+
+    // Free any stream ring buffers the engine didn't close explicitly.
+    // VideoPlayer addons normally CloseStream from their dtor, but a crash-
+    // out path or a forgotten cleanup shouldn't leak the (potentially 700 KB
+    // / 4-stream) ring allocations.
+    for (uint32_t i = 0; i < kMaxStreams; ++i)
+    {
+        if (sStreams[i].ring != nullptr) free(sStreams[i].ring);
+        sStreams[i] = PspStream{};
+    }
+
     if (sVoiceLock >= 0)
     {
         sceKernelDeleteSema(sVoiceLock);
@@ -375,18 +478,235 @@ uint8_t* AUD_AllocWaveBuffer(uint32_t size) { return (uint8_t*)malloc(size); }
 void AUD_FreeWaveBuffer(void* buffer) { free(buffer); }
 void AUD_ProcessWaveBuffer(SoundWave* /*soundWave*/) {}
 
-// ----- Streaming voices (used by VideoPlayer addon, etc.) -----------------
-// Stub for now — return zero stream-id to signal "stream creation failed",
-// which the engine's streaming consumers handle gracefully (they fall back
-// to silent video or skip the audio track). Plumbing a streaming voice
-// through the mixer is a follow-up: needs a PCM ring buffer per stream,
-// drained by MixOneBuffer the same way active voices are.
-uint32_t AUD_OpenStream(uint32_t /*sampleRate*/, uint32_t /*numChannels*/, uint32_t /*bitsPerSample*/) { return 0; }
-void     AUD_CloseStream(uint32_t /*streamId*/) {}
-int32_t  AUD_SubmitStreamBuffer(uint32_t /*streamId*/, const uint8_t* /*data*/, uint32_t byteSize) { return (int32_t)byteSize; }
-uint64_t AUD_GetStreamPlayedSamples(uint32_t /*streamId*/) { return 0; }
-void     AUD_SetStreamVolume(uint32_t /*streamId*/, float /*volume*/) {}
-void     AUD_SetStreamPaused(uint32_t /*streamId*/, bool /*paused*/) {}
-void     AUD_FlushStream(uint32_t /*streamId*/) {}
+// ----- Streaming voices ---------------------------------------------------
+// Used by the engine's VideoPlayer addon and any other consumer that needs
+// to feed PCM as it's decoded (rather than playing a fully-loaded SoundWave).
+// Stream IDs are 1-based — 0 is the sentinel for "creation failed" and
+// engine consumers fall back to silent playback when they see it.
+
+uint32_t AUD_OpenStream(uint32_t sampleRate, uint32_t numChannels, uint32_t bitsPerSample)
+{
+    if (sAudioChannel < 0) return 0;  // audio backend not initialised
+    if (numChannels != 1 && numChannels != 2)
+    {
+        LogWarning("AUD_OpenStream: only mono/stereo supported (got %u channels)", numChannels);
+        return 0;
+    }
+    if (bitsPerSample != 16)
+    {
+        LogWarning("AUD_OpenStream: only 16-bit PCM supported (got %u bps)", bitsPerSample);
+        return 0;
+    }
+
+    sceKernelWaitSema(sVoiceLock, 1, nullptr);
+
+    uint32_t pickedIdx = kMaxStreams;
+    for (uint32_t i = 0; i < kMaxStreams; ++i)
+    {
+        if (!sStreams[i].inUse)
+        {
+            pickedIdx = i;
+            break;
+        }
+    }
+
+    if (pickedIdx == kMaxStreams)
+    {
+        sceKernelSignalSema(sVoiceLock, 1);
+        LogWarning("AUD_OpenStream: no free stream slots (pool=%u)", kMaxStreams);
+        return 0;
+    }
+
+    PspStream& s = sStreams[pickedIdx];
+
+    // Ring size: kStreamRingSecs of PCM at the source sample rate. Each
+    // frame is `bpf` bytes = numChannels * (bitsPerSample/8). Allocated as
+    // int16_t (the only format we accept) so indexing matches FetchStreamFrame.
+    const uint32_t ringFrames = (uint32_t)((double)sampleRate * kStreamRingSecs);
+    const uint32_t int16Count = ringFrames * numChannels;
+    s.ring = (int16_t*)memalign(16, int16Count * sizeof(int16_t));
+    if (s.ring == nullptr)
+    {
+        sceKernelSignalSema(sVoiceLock, 1);
+        LogError("AUD_OpenStream: ring alloc failed (%u frames × %u ch × 2 B)",
+                 ringFrames, numChannels);
+        return 0;
+    }
+
+    s.ringFrames    = ringFrames;
+    s.srcSampleRate = sampleRate;
+    s.numChannels   = (uint8_t)numChannels;
+    s.bitsPerSample = (uint8_t)bitsPerSample;
+    s.writeFrameAbs = 0;
+    s.readFrameAbs  = 0.0;
+    s.rate          = (double)sampleRate / (double)kOutputRate;
+
+    LogDebug("AUD_OpenStream: slot=%u srcRate=%u ch=%u bps=%u rate=%.4f ringFrames=%u",
+             pickedIdx + 1, sampleRate, numChannels, bitsPerSample, s.rate, ringFrames);
+    s.leftVolQ15    = ClampVolQ15(1.0f);
+    s.rightVolQ15   = ClampVolQ15(1.0f);
+    s.paused        = false;
+    s.inUse         = true;
+
+    sceKernelSignalSema(sVoiceLock, 1);
+
+    // Stream IDs are 1-based so 0 stays as the failure sentinel.
+    return pickedIdx + 1;
+}
+
+void AUD_CloseStream(uint32_t streamId)
+{
+    if (streamId == 0 || streamId > kMaxStreams) return;
+    sceKernelWaitSema(sVoiceLock, 1, nullptr);
+
+    PspStream& s = sStreams[streamId - 1];
+    if (s.inUse)
+    {
+        if (s.ring != nullptr) { free(s.ring); s.ring = nullptr; }
+        s.ringFrames    = 0;
+        s.writeFrameAbs = 0;
+        s.readFrameAbs  = 0.0;
+        s.inUse         = false;
+        s.paused        = false;
+    }
+
+    sceKernelSignalSema(sVoiceLock, 1);
+}
+
+int32_t AUD_SubmitStreamBuffer(uint32_t streamId, const uint8_t* data, uint32_t byteSize)
+{
+    if (streamId == 0 || streamId > kMaxStreams) return 0;
+    if (data == nullptr || byteSize == 0) return 0;
+
+    sceKernelWaitSema(sVoiceLock, 1, nullptr);
+    PspStream& s = sStreams[streamId - 1];
+    if (!s.inUse || s.ring == nullptr)
+    {
+        sceKernelSignalSema(sVoiceLock, 1);
+        return 0;
+    }
+
+    // Convert bytes → frames, truncating to a frame boundary. Engine consumers
+    // should always submit aligned data (16-bit PCM = 2-byte sample, mono =
+    // 2-byte frame, stereo = 4-byte frame), but be defensive.
+    const uint32_t bpf = s.numChannels * 2;     // 16-bit guaranteed
+    uint32_t submitFrames = byteSize / bpf;
+    if (submitFrames == 0)
+    {
+        sceKernelSignalSema(sVoiceLock, 1);
+        return 0;
+    }
+
+    // Hard cap: if the caller submits more than the ring's entire capacity in
+    // one go, we'd just be overwriting the buffer's tail with its head. Clip
+    // to ring size — caller will get a "bytes accepted < bytes offered"
+    // return and can throttle. (VideoPlayer's pump-based design is supposed
+    // to submit smaller chunks, but a bursty decoder hitting first-time
+    // catch-up could otherwise blow this assumption.)
+    if (submitFrames > s.ringFrames)
+    {
+        submitFrames = s.ringFrames;
+    }
+
+    // Reject (return 0 accepted) if the ring can't hold the whole submit.
+    // The caller's retry path (mPendingAudioRetry in VideoPlayer3D) holds
+    // the chunk and tries again next tick — by then the mixer has drained
+    // enough frames to make room.
+    //
+    // Previous behavior was to fast-forward `readFrameAbs` to make room,
+    // which silently advanced the playhead the audio clock reports. The
+    // video player uses that clock as master, so it raced ahead and the
+    // video played multiple-x speed (worst at low-bitrate presets like
+    // Tiny, where the decoder produces audio many times faster than real-
+    // time so the ring would refuse to ever NOT be full).
+    const uint64_t readAbsU64 = (uint64_t)s.readFrameAbs;
+    const uint64_t inFlight   = s.writeFrameAbs - readAbsU64;
+    const uint32_t freeFrames = (inFlight < s.ringFrames)
+                                  ? (uint32_t)(s.ringFrames - inFlight)
+                                  : 0u;
+    if (submitFrames > freeFrames)
+    {
+        sceKernelSignalSema(sVoiceLock, 1);
+        return 0;
+    }
+
+    // Copy frames into the ring, wrapping at capacity. Two memcpys at worst
+    // (the second handles the wrap).
+    const int16_t* srcInt16 = reinterpret_cast<const int16_t*>(data);
+    const uint32_t headIdx  = (uint32_t)(s.writeFrameAbs % s.ringFrames);
+    const uint32_t firstChunkFrames = (headIdx + submitFrames <= s.ringFrames)
+                                        ? submitFrames
+                                        : (s.ringFrames - headIdx);
+
+    memcpy(s.ring + headIdx * s.numChannels,
+           srcInt16,
+           firstChunkFrames * s.numChannels * sizeof(int16_t));
+
+    if (firstChunkFrames < submitFrames)
+    {
+        const uint32_t wrappedFrames = submitFrames - firstChunkFrames;
+        memcpy(s.ring,
+               srcInt16 + firstChunkFrames * s.numChannels,
+               wrappedFrames * s.numChannels * sizeof(int16_t));
+    }
+
+    s.writeFrameAbs += submitFrames;
+
+    sceKernelSignalSema(sVoiceLock, 1);
+    return (int32_t)(submitFrames * bpf);
+}
+
+uint64_t AUD_GetStreamPlayedSamples(uint32_t streamId)
+{
+    if (streamId == 0 || streamId > kMaxStreams) return 0;
+
+    // Read without locking — readFrameAbs is a double (8 bytes); on 32-bit
+    // MIPS the load isn't atomic, but the consumer (A/V sync) tolerates a
+    // few-µs-stale value better than the 200 µs the lock might add to the
+    // mixer's tight loop. If sync glitches show up here we can switch to
+    // a 64-bit uint counter updated separately under the lock.
+    const PspStream& s = sStreams[streamId - 1];
+    return s.inUse ? (uint64_t)s.readFrameAbs : 0;
+}
+
+void AUD_SetStreamVolume(uint32_t streamId, float volume)
+{
+    if (streamId == 0 || streamId > kMaxStreams) return;
+    sceKernelWaitSema(sVoiceLock, 1, nullptr);
+    PspStream& s = sStreams[streamId - 1];
+    if (s.inUse)
+    {
+        s.leftVolQ15  = ClampVolQ15(volume);
+        s.rightVolQ15 = ClampVolQ15(volume);
+    }
+    sceKernelSignalSema(sVoiceLock, 1);
+}
+
+void AUD_SetStreamPaused(uint32_t streamId, bool paused)
+{
+    if (streamId == 0 || streamId > kMaxStreams) return;
+    sceKernelWaitSema(sVoiceLock, 1, nullptr);
+    if (sStreams[streamId - 1].inUse)
+    {
+        sStreams[streamId - 1].paused = paused;
+    }
+    sceKernelSignalSema(sVoiceLock, 1);
+}
+
+void AUD_FlushStream(uint32_t streamId)
+{
+    if (streamId == 0 || streamId > kMaxStreams) return;
+    sceKernelWaitSema(sVoiceLock, 1, nullptr);
+    PspStream& s = sStreams[streamId - 1];
+    if (s.inUse)
+    {
+        // Drop every queued frame by rewinding write to read. readFrameAbs
+        // doesn't change — the next submit picks up from the same playhead
+        // position, so AUD_GetStreamPlayedSamples stays monotonic from the
+        // engine's perspective (matters for A/V sync after a seek).
+        s.writeFrameAbs = (uint64_t)s.readFrameAbs;
+    }
+    sceKernelSignalSema(sVoiceLock, 1);
+}
 
 #endif // POLYPHASE_PLATFORM_ADDON

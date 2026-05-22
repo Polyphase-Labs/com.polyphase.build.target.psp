@@ -51,6 +51,22 @@ namespace psp
     constexpr uint32_t kStaticColorVertexFlags =
         GU_TEXTURE_32BITF | GU_COLOR_8888 | GU_NORMAL_32BITF | GU_VERTEX_32BITF |
         GU_INDEX_16BIT    | GU_TRANSFORM_3D;
+
+    // Particle billboard vertex — no normal (particles are typically unlit /
+    // additive), no index buffer (we expand each quad to 6 verts at repack
+    // time and just draw GU_TRIANGLES). Matches engine `VertexParticle`'s
+    // 24 bytes, only the field order differs (PSP HW mandates
+    // texture → color → position).
+    struct __attribute__((packed)) ParticleVertex
+    {
+        float    u, v;
+        uint32_t color;     // RGBA8888 little-endian = ABGR memory order
+        float    x, y, z;
+    };
+    static_assert(sizeof(ParticleVertex) == 24, "PSP particle vertex must be 24 bytes");
+
+    constexpr uint32_t kParticleVertexFlags =
+        GU_TEXTURE_32BITF | GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_3D;
 }
 
 #endif // POLYPHASE_PLATFORM_ADDON

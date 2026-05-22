@@ -115,6 +115,25 @@ endif
 
 ADDON_PSP_RUNTIME = $(PROJECT_ROOT)/Packages/com.polyphase.build.target.psp/Runtime/PSP
 
+# ---- Engine-native addon injection -----------------------------------------
+# The editor's addon-target dispatch writes $(PROJECT_ROOT)/Generated/AddonInject.mk
+# right before invoking GetCompileCommand. The file DEFINES ADDON_* variables
+# (ADDON_SOURCES, ADDON_DEFINES, ADDON_INCDIR, ADDON_LIBDIR, ADDON_LIBS,
+# ADDON_CPPFILES_EXTRA) that the rest of this Makefile substitutes into its
+# own SOURCES / CFLAGS / INCDIR / LIBS / CPPFILES variables at definition
+# time — so engine-target addons (VideoPlayer, custom node/asset addons)
+# compile into the PSP build alongside the engine itself.
+#
+# `-include` (dash) is non-fatal — if the file's missing (very first build
+# before the editor writes it, or a bare `make` outside the editor) the
+# ADDON_* variables just expand to empty and the build still works without
+# addon extras.
+#
+# The file defines (not appends) variables so we can include it BEFORE our
+# own SOURCES/CFLAGS/INCDIR/etc are set without anything getting clobbered
+# by later `=` assignments.
+-include $(PROJECT_ROOT)/Generated/AddonInject.mk
+
 # ---- Source discovery -------------------------------------------------------
 # PSPSDK's build.mak does its own wildcard expansion against SOURCES, picking
 # every .c / .cpp / .S under each listed directory. Adding a new source file
@@ -167,7 +186,8 @@ SOURCES = \
     $(POLYPHASE_PATH)/External/recastnavigation/Detour/Source \
     $(ADDON_PSP_RUNTIME) \
     $(ADDON_PSP_RUNTIME)/Graphics_PSPGU \
-    $(PROJECT_ROOT)/Source
+    $(PROJECT_ROOT)/Source \
+    $(ADDON_SOURCES)
 
 # ---- Include path -----------------------------------------------------------
 INCDIR = \
@@ -184,7 +204,8 @@ INCDIR = \
     $(POLYPHASE_PATH)/External/Assimp/contrib/rapidjson \
     $(POLYPHASE_PATH)/External/recastnavigation/Recast/Include \
     $(POLYPHASE_PATH)/External/recastnavigation/Detour/Include \
-    $(POLYPHASE_PATH)/Engine/External/PolyVox/include
+    $(POLYPHASE_PATH)/Engine/External/PolyVox/include \
+    $(ADDON_INCDIR)
 
 # ---- Object list ------------------------------------------------------------
 # PSPSDK's build.mak consumes an explicit OBJS list — unlike devkitPro's
@@ -211,6 +232,11 @@ ifneq ($(wildcard $(PROJECT_ROOT)/Generated/EmbeddedScripts.cpp),)
 CPPFILES += EmbeddedScripts.cpp
 endif
 
+# Engine-target addon registrar (AddonPlugins.cpp) + any other generated CPP
+# files contributed by AddonInject.mk. Empty when there are no engine-target
+# addons.
+CPPFILES += $(ADDON_CPPFILES_EXTRA)
+
 VPATH := $(SOURCES) $(PROJECT_ROOT)/Generated
 OBJS  := $(CPPFILES:.cpp=.o) $(CFILES:.c=.o)
 
@@ -226,7 +252,8 @@ DEFINES = \
     -DEDITOR=0 \
     -DLUA_ENABLED=1 \
     -DGLM_FORCE_RADIANS \
-    -DLOGGING_ENABLED=1
+    -DLOGGING_ENABLED=1 \
+    $(ADDON_DEFINES)
 
 CFLAGS   = -O2 -G0 -Wall -Wno-unused-parameter -Wno-unused-variable $(DEFINES)
 CXXFLAGS = $(CFLAGS) -fno-exceptions -fno-rtti -std=c++17
@@ -242,7 +269,7 @@ ASFLAGS  = $(CFLAGS)
 # -lpspnet_apctl -lpsphprm -lpspdebug -lpspdisplay -lpspctrl -lpspge` etc.
 # in the correct order; duplicating them in LIBS scrambles the link order
 # and triggers psp-fixup-imports' "stubs out of order" warning.
-LIBDIR =
+LIBDIR = $(ADDON_LIBDIR)
 # `--allow-multiple-definition` is needed because newlib's libc.a and PSPSDK's
 # libpspkernel.a both export `strtol` / `strtoul`. The pspkernel versions are
 # syscall thunks and the newlib ones are full implementations; either works,
@@ -253,7 +280,26 @@ LIBS = \
     -lpspaudio -lpspaudiocodec \
     -lpsppower \
     -lpsprtc -lpspsdk \
-    -lm -lstdc++
+    -lmbedtls -lmbedx509 -lmbedcrypto \
+    -lpspnet_inet -lpspnet_resolver -lpspnet_apctl -lpspnet \
+    -lpspwlan \
+    -lm -lstdc++ \
+    $(ADDON_LIBS)
+
+# mbedTLS link-order note: HttpBackend_PSP.cpp drives mbedTLS directly
+# (no libcurl — see the file header for rationale). mbedTLS (TLS layer)
+# depends on mbedx509 (X.509 parsing) depends on mbedcrypto (primitives);
+# these MUST stay in that order, MIPS ld resolves strictly left-to-right.
+# Below that, mbedTLS's BIO callbacks go through engine NET_* which calls
+# pspnet_inet → pspnet → pspwlan, so those continue the dependency chain.
+# Reshuffling will produce "undefined reference to mbedtls_*" or
+# "sceNetInet*" at link time.
+#
+# libcurl is intentionally NOT linked here anymore. PSPSDK's prebuilt
+# libcurl was buggy (uninitialized state, wild-pointer crashes during
+# response handling) and its mbedTLS integration died with
+# `SSL_INTERNAL_ERROR` for reasons we couldn't fix from application code.
+# Direct mbedTLS is the same pattern HttpBackend_Dolphin uses on Wii/GCN.
 
 # ---- PSPSDK boilerplate -----------------------------------------------------
 # PSPDEV resolution. We deliberately DON'T call `psp-config --pspsdk-path` here

@@ -17,6 +17,7 @@
 
 struct Vertex;
 struct VertexColor;
+struct VertexParticle;
 
 namespace psp
 {
@@ -39,6 +40,16 @@ namespace psp
     // when read byte-wise the order is r,g,b,a — that matches GU_COLOR_8888.
     // Engine stores it as RGBA in the uint32 so we swap to little-endian ABGR.
     void RepackVerticesColor(const VertexColor* src, uint32_t count, StaticColorVertex* dst);
+
+    // Repack engine particle billboards into PSP format AND expand each
+    // 4-vertex quad to 6 triangle-list vertices, matching the GameCube /
+    // Vulkan winding (`0,1,2, 2,1,3` per particle).
+    //
+    // Input:  `src` has `numParticles * 4` VertexParticle entries.
+    // Output: `dst` must hold `numParticles * 6` ParticleVertex entries.
+    void RepackParticleVertices(const VertexParticle* src,
+                                uint32_t numParticles,
+                                ParticleVertex* dst);
 
     // Convert engine RGBA8 colour (R in low byte) to PSP GU_COLOR_8888 byte
     // order (A in high byte, B in next, G in next, R in low byte). On a
