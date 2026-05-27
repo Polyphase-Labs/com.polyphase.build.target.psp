@@ -46,6 +46,22 @@
 extern uint32_t gNumEmbeddedScripts;
 extern EmbeddedFile gEmbeddedScripts[];
 
+// C++ pure-virtual-call handler. Normally libstdc++/libsupc++ supplies this,
+// but with -fno-exceptions -fno-rtti the PSP link never pulls it in, leaving
+// __cxa_pure_virtual UNDEFINED. Every abstract-class vtable slot for a pure
+// virtual then carries a relocation against the null (undefined) section. A
+// few of those are tolerated, but the engine has ~200 — enough that the PSP
+// firmware's module loader rejects the whole EBOOT.PBP at load time as
+// "The data is corrupted." (PPSSPP tolerates the same relocations, which is
+// exactly why the build ran in the emulator but not on real hardware.)
+// Defining the symbol here resolves those relocations and lets the module load.
+extern "C" void __cxa_pure_virtual()
+{
+    // Calling a pure virtual is a real bug; there's no safe recovery. Spin so
+    // it's catchable rather than corrupting execution silently.
+    for (;;) {}
+}
+
 // Boot-checkpoint log appender. Independent of the engine's SYS_Log so it
 // works BEFORE Initialize() runs — if the engine crashes early during init,
 // the last checkpoint written tells us exactly where. Writes to the same

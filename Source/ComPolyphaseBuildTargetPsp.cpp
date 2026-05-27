@@ -91,6 +91,7 @@ namespace
     constexpr const char* kWslDistroKey     = "psp.wslDistro";      // Windows only — override default WSL distro
     constexpr const char* kPspDevPathKey    = "psp.pspdevPath";     // Path to pspdev install inside the build shell
     constexpr const char* kJobsKey          = "psp.jobs";           // make -j parallelism (default 4; engine TUs are 1-2 GB/TU peak)
+    constexpr const char* kBuildToIsoKey    = "psp.buildToIso";     // "1" = pack a bootable UMD ISO and leave only <project>.iso
 
     constexpr const char* kTitleDefault     = "Polyphase Game";
     constexpr const char* kDiscIdDefault    = "POLY00001";
@@ -103,6 +104,7 @@ namespace
     // can bump this via the "Jobs" build-profile option.
     constexpr const char* kJobsDefault      = "4";
     constexpr const char* kFirmwareDefault  = "5.50";
+    constexpr const char* kBuildToIsoDefault = "0";                 // off by default — the EBOOT.PBP flow is the common case
     // No default for PSPDEV path — we leave it empty so the makefile's own
     // fallback ladder kicks in (/usr/local/pspdev). Users with non-standard
     // installs (e.g. /mnt/c/pspdev for Windows-side pspdev exposed through
@@ -345,9 +347,10 @@ namespace
         {
             cleanPrefix =
                 "(cd " + ShellPath(intermediateDir) +
-                " && rm -f *.o *.d *.elf 2>/dev/null; true) && " +
+                " && rm -f *.o *.d *.elf *.prx 2>/dev/null; true) && " +
                 "(rm -f " + ShellPath(std::string(ctx->projectDir) + "/Build/PSP") +
-                "/*.elf 2>/dev/null; true) && ";
+                "/*.elf " + ShellPath(std::string(ctx->projectDir) + "/Build/PSP") +
+                "/*.prx 2>/dev/null; true) && ";
         }
 
         // Pass PROJECT_ROOT explicitly so the Makefile doesn't have to derive
@@ -371,9 +374,11 @@ namespace
     {
         if (ctx == nullptr || ctx->projectDir == nullptr || ctx->projectName == nullptr) return 0;
 
-        // PSPSDK projects compile to an unwrapped ELF first; pack-pbp later
-        // turns that into EBOOT.PBP. Convention: Build/PSP/<name>.elf.
-        std::snprintf(outPath, cap, "%s/Build/PSP/%s.elf",
+        // PSPSDK projects compile to a relocatable user-mode PRX (BUILD_PRX=1
+        // in Makefile_PSP); pack-pbp later wraps it as EBOOT.PBP's DATA.PSP.
+        // A PRX (not a static ELF) is what modern firmware/CFW will actually
+        // boot. Convention: Build/PSP/<name>.prx.
+        std::snprintf(outPath, cap, "%s/Build/PSP/%s.prx",
                       ctx->projectDir, ctx->projectName);
         return 1;
     }
@@ -411,10 +416,22 @@ namespace
         const std::string titleQuoted = quoteForBash(title);
         const std::string sfoQuoted   = ShellPath(outSfoPath);
 
-        // Try mksfoex (PSPSDK's modern variant — supports DISC_ID + firmware).
+        // Generate PARAM.SFO with mksfoex. CRITICAL: do NOT pass
+        // `-s PSP_SYSTEM_VER` here. mksfoex hoists every explicitly set key
+        // (-d / -s) to the front of the SFO index table; with -d MEMSIZE=1 and
+        // -s DISC_ID that already places two keys out of the alphabetical key
+        // order the PSP firmware's module loader expects. Adding a THIRD hoisted
+        // key (PSP_SYSTEM_VER) pushes the index past what the loader tolerates,
+        // and real hardware rejects the EBOOT.PBP as "The data is corrupted"
+        // (PPSSPP is lenient and loads it regardless — which is why builds ran
+        // in the emulator but not on a device). Leaving PSP_SYSTEM_VER unset
+        // lets mksfoex emit its default ("1.00") in the correct sorted slot,
+        // which loads on hardware. The "Min Firmware" profile option is thus
+        // informational only; homebrew runs regardless of the value.
+        (void)firmware;
         {
             std::string body = PspDevAutoDetectPrelude() + " && mksfoex -d MEMSIZE=1 -s DISC_ID=" +
-                               discId + " -s PSP_SYSTEM_VER=" + firmware + " " +
+                               discId + " " +
                                titleQuoted + " " + sfoQuoted;
             const std::string cmd = WrapShell(ctx, body);
             if (ctx && ctx->WriteOutputLine) ctx->WriteOutputLine(cmd.c_str());
@@ -536,6 +553,111 @@ namespace
         }
     }
 
+    // Build a bootable PSP UMD ISO from the already-packaged output directory.
+    //
+    // Layout (relative to the disc root, disc0:/ at runtime):
+    //   PSP_GAME/PARAM.SFO
+    //   PSP_GAME/ICON0.PNG, PSP_GAME/PIC1.PNG   (optional)
+    //   PSP_GAME/SYSDIR/{EBOOT.BIN, BOOT.BIN}    (the raw engine .elf)
+    //   UMD_DATA.BIN                             (<DISC_ID>|<hash>|<ver>|<region>)
+    //   <assets>                                 (Config.ini, <project>/, Engine/..., content)
+    //
+    // The engine .elf is dropped in unencrypted — runs in PPSSPP and on CFW
+    // PSPs with an unencrypted-ISO loader (retail UMD signing is out of scope).
+    // Assets are copied to the disc root so the runtime's disc0:/ asset base
+    // (SYS_GetPolyphasePath in Runtime/PSP/System_PSP.cpp) finds them there.
+    //
+    // Staging happens OUTSIDE the package dir so the recursive copy can't
+    // recurse into itself. Everything runs in one bash body (WSL on Windows);
+    // paths are single-quoted via ShellPath so spaces survive and the body
+    // never needs a raw double quote (which would close the `bash -lc "..."`).
+    bool RunIsoBuilder(const PolyphaseBuildContext* ctx,
+                       const std::string& outDir,
+                       const std::string& projectName,
+                       const std::string& discId,
+                       const std::string& iconPath,
+                       const std::string& bgPath,
+                       const std::string& sfoPath,
+                       const std::string& prxPath,
+                       const std::string& isoPath,
+                       const std::string& stageDir)
+    {
+        const std::string sysdir = stageDir + "/PSP_GAME/SYSDIR";
+
+        auto cp = [](const std::string& a, const std::string& b) {
+            return std::string("cp ") + ShellPath(a) + " " + ShellPath(b);
+        };
+
+        std::string body;
+        body += "rm -rf " + ShellPath(stageDir) + " && ";
+        body += "mkdir -p " + ShellPath(sysdir) + " && ";
+        // Mirror every packaged asset NEXT TO the executable, in PSP_GAME/SYSDIR/.
+        // At runtime PPSSPP/CFW set the working directory to the EBOOT.BIN folder
+        // (PSP_GAME/SYSDIR/), and the engine loads most assets via cwd-relative
+        // paths ("Engine/Assets", "Config.ini", ...) — exactly as a memory-stick
+        // PBP build resolves them next to EBOOT.PBP. Staging assets here makes
+        // those bare-relative lookups resolve on the disc. (preserves hidden files)
+        body += "cp -r " + ShellPath(outDir + "/.") + " " + ShellPath(sysdir) + " && ";
+        // Drop the memory-stick-only artifacts that shouldn't ship in SYSDIR.
+        body += "rm -f " + ShellPath(sysdir + "/EBOOT.PBP") + " " +
+                ShellPath(sysdir + "/" + projectName + ".prx") + " " +
+                ShellPath(sysdir + "/PARAM.SFO") + " && ";
+        // PARAM.SFO belongs under PSP_GAME/ (firmware reads it there).
+        body += cp(sfoPath, stageDir + "/PSP_GAME/PARAM.SFO") + " && ";
+        body += cp(prxPath, sysdir + "/EBOOT.BIN") + " && ";
+        body += cp(prxPath, sysdir + "/BOOT.BIN") + " && ";
+        if (!iconPath.empty()) body += cp(iconPath, stageDir + "/PSP_GAME/ICON0.PNG") + " && ";
+        if (!bgPath.empty())   body += cp(bgPath,   stageDir + "/PSP_GAME/PIC1.PNG")  + " && ";
+        // Minimal UMD_DATA.BIN: <DISC_ID>|<hash16>|<version>|<region>. discId is
+        // constrained to alphanumerics, so a single-quoted literal is safe.
+        body += "printf '%s' '" + discId + "|0000000000000000|0001|G' > " +
+                ShellPath(stageDir + "/UMD_DATA.BIN") + " && ";
+        // Build with whichever cdrtools/cdrkit binary is present. -iso-level 4
+        // (ISO 9660:1999) + Joliet (-J) both preserve the engine's mixed-case
+        // long asset filenames. If neither tool exists, fail with an install hint.
+        const std::string mkargs =
+            " -quiet -iso-level 4 -J -V '" + discId + "' -o " +
+            ShellPath(isoPath) + " " + ShellPath(stageDir);
+        body += "if command -v mkisofs >/dev/null 2>&1; then mkisofs" + mkargs +
+                "; elif command -v genisoimage >/dev/null 2>&1; then genisoimage" + mkargs +
+                "; else echo 'PSP ISO: neither mkisofs nor genisoimage found. Install one "
+                "(WSL/Linux: sudo apt install genisoimage; macOS: brew install cdrtools).' >&2; "
+                "exit 3; fi";
+
+        const std::string cmd = WrapShell(ctx, body);
+        if (ctx->WriteOutputLine != nullptr) ctx->WriteOutputLine(cmd.c_str());
+        const int rc = std::system(cmd.c_str());
+        if (rc != 0)
+        {
+            if (ctx->Log != nullptr)
+            {
+                char msg[256];
+                std::snprintf(msg, sizeof(msg),
+                    "PSP ISO build failed (rc=%d). Ensure mkisofs/genisoimage is on PATH "
+                    "in the build shell (WSL on Windows).", rc);
+                ctx->Log(POLYPHASE_BT_LOG_ERROR, msg);
+            }
+            return false;
+        }
+        return true;
+    }
+
+    // Strip the package dir down to just <project>.iso (the user-selected
+    // ISO-only deliverable) and remove the ISO stage. `-not -name` rather than
+    // `! -name` avoids any history-expansion ambiguity in the bash body.
+    void CleanOutputExceptIso(const PolyphaseBuildContext* ctx,
+                              const std::string& outDir,
+                              const std::string& isoName,
+                              const std::string& stageDir)
+    {
+        std::string body =
+            "find " + ShellPath(outDir) + " -mindepth 1 -maxdepth 1 -not -name '" +
+            isoName + "' -exec rm -rf {} + ; rm -rf " + ShellPath(stageDir);
+        const std::string cmd = WrapShell(ctx, body);
+        if (ctx->WriteOutputLine != nullptr) ctx->WriteOutputLine(cmd.c_str());
+        std::system(cmd.c_str());
+    }
+
     int32_t Psp_PostPackage(const PolyphaseBuildContext* ctx)
     {
         if (ctx == nullptr || ctx->packageOutputDir == nullptr || ctx->projectName == nullptr) return 0;
@@ -563,7 +685,9 @@ namespace
         }
 
         const std::string outDir   = ctx->packageOutputDir;
-        const std::string elfPath  = outDir + "/" + ctx->projectName + ".elf";
+        // The editor copied GetCompiledBinaryPath() (the .prx) into the package
+        // dir; that relocatable PRX is the executable we wrap / boot.
+        const std::string prxPath  = outDir + "/" + ctx->projectName + ".prx";
         const std::string sfoPath  = outDir + "/PARAM.SFO";
         const std::string ebootPath = outDir + "/EBOOT.PBP";
 
@@ -594,7 +718,7 @@ namespace
 
         // (2) pack-pbp slot order is fixed by PSPSDK convention:
         //       EBOOT.PBP <sfo> <icon0.png> <icon1.pmf> <pic0.png> <pic1.png> <snd0.at3> <data.psp> <psar>
-        //     We pass NULL for any slot we don't use. The .elf becomes the
+        //     We pass NULL for any slot we don't use. The .prx becomes the
         //     DATA.PSP payload (slot 7), which the PSP loader executes.
         auto slotOrNull = [](const std::string& path) {
             return path.empty() ? std::string("NULL") : ShellPath(path);
@@ -605,7 +729,7 @@ namespace
                            ShellPath(sfoPath) + " " +
                            slotOrNull(iconPath) + " NULL NULL " +
                            slotOrNull(bgPath) + " NULL " +
-                           ShellPath(elfPath) + " NULL";
+                           ShellPath(prxPath) + " NULL";
 
         const std::string cmd = WrapShell(ctx, body);
         if (ctx->WriteOutputLine != nullptr) ctx->WriteOutputLine(cmd.c_str());
@@ -631,6 +755,39 @@ namespace
                 ebootPath.c_str(), discId.c_str(), firmware.c_str());
             ctx->Log(POLYPHASE_BT_LOG_DEBUG, ok);
         }
+
+        // (3) Optional: repack into a bootable UMD ISO, then strip the folder
+        //     down to just <project>.iso. Mirrors the EBOOT.PBP slot inputs —
+        //     the staged .prx becomes PSP_GAME/SYSDIR/EBOOT.BIN and the assets
+        //     sit alongside it in SYSDIR (see RunIsoBuilder + Runtime/PSP runtime).
+        if (ReadOption(ctx, kBuildToIsoKey, kBuildToIsoDefault) == "1")
+        {
+            if (ctx->projectDir == nullptr)
+            {
+                if (ctx->Log != nullptr)
+                    ctx->Log(POLYPHASE_BT_LOG_ERROR,
+                             "PSP ISO: projectDir unavailable; cannot stage the ISO.");
+                return 0;
+            }
+
+            const std::string isoName  = std::string(ctx->projectName) + ".iso";
+            const std::string isoPath  = outDir + "/" + isoName;
+            const std::string stageDir = std::string(ctx->projectDir) + "/Intermediate/PSP/isoroot";
+
+            if (!RunIsoBuilder(ctx, outDir, ctx->projectName, discId,
+                               iconPath, bgPath, sfoPath, prxPath, isoPath, stageDir))
+            {
+                return 0;
+            }
+            CleanOutputExceptIso(ctx, outDir, isoName, stageDir);
+
+            if (ctx->Log != nullptr)
+            {
+                char ok[512];
+                std::snprintf(ok, sizeof(ok), "PSP ISO complete: %s", isoPath.c_str());
+                ctx->Log(POLYPHASE_BT_LOG_DEBUG, ok);
+            }
+        }
         return 1;
     }
 
@@ -645,8 +802,17 @@ namespace
             ? std::string("PPSSPPWindows64.exe")
             : override_;
 
-        // PPSSPP accepts a path to either EBOOT.PBP or the bare .elf —
-        // we hand it the packed PBP so the SFO metadata is honoured.
+        // ISO builds leave only <project>.iso in the package dir — PPSSPP runs
+        // an ISO directly. Otherwise hand it the packed PBP so the SFO metadata
+        // is honoured (PPSSPP also accepts the bare .elf).
+        if (ctx->projectName != nullptr &&
+            ReadOption(ctx, kBuildToIsoKey, kBuildToIsoDefault) == "1")
+        {
+            std::snprintf(outCmd, cap, "\"%s\" \"%s/%s.iso\"",
+                          exe.c_str(), ctx->packageOutputDir, ctx->projectName);
+            return 1;
+        }
+
         std::snprintf(outCmd, cap,
             "\"%s\" \"%s/EBOOT.PBP\"",
             exe.c_str(),
@@ -660,6 +826,16 @@ namespace
         // PSP_PSPLINK_HOST to the host:port their psplink server listens on.
         // pspsh lives inside PSPSDK, so on Windows it runs through WSL.
         if (ctx == nullptr || ctx->packageOutputDir == nullptr) return 0;
+
+        // ISO mode strips the EBOOT.PBP that pspsh deploys, so USB launch can't
+        // work — tell the user rather than failing with an opaque pspsh error.
+        if (ReadOption(ctx, kBuildToIsoKey, kBuildToIsoDefault) == "1")
+        {
+            std::snprintf(outCmd, cap,
+                "echo \"ISO mode: Run on Device (pspsh) needs an EBOOT.PBP. "
+                "Disable 'Build to ISO' to deploy over USB.\" && exit 1");
+            return 1;
+        }
 
         const std::string host = GetEnvOrEmpty("PSP_PSPLINK_HOST");
         if (host.empty())
@@ -817,6 +993,22 @@ namespace
                 ImGui::SetTooltip("Project-relative path to PIC1.PNG. Optional XMB background.");
         }
 
+        // ----- Build to ISO ------------------------------------------------
+        {
+            std::string current = ReadOption(ctx, kBuildToIsoKey, kBuildToIsoDefault);
+            bool buildToIso = (current == "1");
+            if (ImGui::Checkbox("Build to ISO (bootable UMD)", &buildToIso))
+            {
+                ctx->SetProfileSetting(kBuildToIsoKey, buildToIso ? "1" : "0");
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Pack the build into a bootable PSP ISO (PSP_GAME/SYSDIR/EBOOT.BIN)\n"
+                                  "and leave only <project>.iso in the output folder.\n"
+                                  "Runs in PPSSPP / on CFW with an unencrypted-ISO loader.\n"
+                                  "Requires genisoimage or mkisofs in the build shell.\n"
+                                  "Note: 'Run on Device' (pspsh) is unavailable in ISO mode.");
+        }
+
         ImGui::Spacing();
 #if defined(_WIN32)
         ImGui::TextDisabled("Windows: PSPSDK runs inside WSL. Install WSL2 + Ubuntu, then");
@@ -826,6 +1018,8 @@ namespace
 #endif
         ImGui::TextDisabled("Default emulator is PPSSPPWindows64.exe — override with PSP_EMULATOR env var.");
         ImGui::TextDisabled("Set PSP_PSPLINK_HOST=<ip>:<port> to enable 'Run on Device' via pspsh.");
+        ImGui::TextDisabled("'Build to ISO' needs genisoimage/mkisofs in the build shell");
+        ImGui::TextDisabled("(WSL/Linux: sudo apt install genisoimage; macOS: brew install cdrtools).");
     }
 
     // Canonical descriptor. Strings are deep-copied by the registry; this

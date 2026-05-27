@@ -102,8 +102,27 @@ std::string SYS_GetExecutablePath()
 
 std::string SYS_GetPolyphasePath()
 {
-    // Engine assets are bundled alongside the EBOOT.
-    return "ms0:/PSP/GAME/POLYPHASE/";
+    // Resolve the asset root once and cache it. Two packaging layouts:
+    //   - EBOOT.PBP on a memory stick: assets sit alongside the EBOOT under
+    //     ms0:/PSP/GAME/POLYPHASE/ (the historical layout).
+    //   - Bootable UMD ISO ("Build to ISO"): the executable lives at
+    //     disc0:/PSP_GAME/SYSDIR/EBOOT.BIN and the assets are at the disc root,
+    //     so when that file exists we resolve assets against disc0:/.
+    // Save data and the boot log keep their own ms0: paths (a disc is read-only).
+    static std::string sBase;
+    if (sBase.empty())
+    {
+        SceIoStat st;
+        // ISO build: the executable and all assets live together in
+        // disc0:/PSP_GAME/SYSDIR/ (that folder is also the runtime cwd, so the
+        // engine's cwd-relative asset loads resolve there too). Memory-stick
+        // PBP builds keep the historical ms0: location.
+        if (sceIoGetstat("disc0:/PSP_GAME/SYSDIR/EBOOT.BIN", &st) >= 0)
+            sBase = "disc0:/PSP_GAME/SYSDIR/";
+        else
+            sBase = "ms0:/PSP/GAME/POLYPHASE/";
+    }
+    return sBase;
 }
 
 std::string SYS_GetCurrentDirectoryPath()

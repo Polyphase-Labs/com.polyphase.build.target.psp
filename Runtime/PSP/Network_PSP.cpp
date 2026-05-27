@@ -29,6 +29,59 @@
 
 #include "Network/Network.h"
 #include "Log.h"
+#include <string.h>
+#include <stdio.h>
+
+#if defined(POLYPHASE_PSP_DISABLE_NET)
+// ============================================================================
+// Networking compiled OUT for this build (Makefile_PSP: DISABLE_NET=1).
+//
+// The PSP network stack — sceNet / sceNetInet / sceNetApctl / sceNetResolver —
+// lives in loadable PRX modules that are NOT resident when a game is launched
+// on real hardware (unlike sceAudio/sceDisplay/sceCtrl/scePower, which always
+// are). Statically importing them makes the firmware fail to resolve the
+// EBOOT's import stubs at load time and reject it as "The data is corrupted."
+// (PPSSPP keeps those libraries always available, which is why a net-linked
+// build boots in the emulator but not on a device.)
+//
+// These inert stubs satisfy the engine's Network interface so everything still
+// links, while leaving the EBOOT free of any sceNet* import. HTTP requests
+// simply report unavailable (NET_IsActive()==false, sockets return -1). Set
+// DISABLE_NET=0 in Makefile_PSP to restore the full implementation below.
+// ============================================================================
+
+void NET_Initialize() {}
+void NET_Shutdown()   {}
+void NET_Update()     {}
+bool NET_IsActive()   { return false; }
+
+SocketHandle NET_SocketCreate() { return -1; }
+void NET_SocketBind(SocketHandle, uint32_t, uint16_t) {}
+int32_t NET_SocketRecvFrom(SocketHandle, char*, uint32_t, uint32_t&, uint16_t&) { return -1; }
+int32_t NET_SocketSendTo(SocketHandle, const char*, uint32_t, uint32_t, uint16_t) { return -1; }
+void NET_SocketSetBlocking(SocketHandle, bool) {}
+void NET_SocketSetBroadcast(SocketHandle, bool) {}
+void NET_SocketGetIpAndPort(SocketHandle, uint32_t& outIp, uint16_t& outPort) { outIp = 0; outPort = 0; }
+int32_t NET_SocketRecv(SocketHandle, char*, uint32_t) { return -1; }
+void NET_SocketClose(SocketHandle) {}
+SocketHandle NET_SocketCreateStream() { return -1; }
+bool NET_SocketConnect(SocketHandle, uint32_t, uint16_t, int32_t) { return false; }
+int32_t NET_SocketSend(SocketHandle, const char*, uint32_t) { return -1; }
+uint32_t NET_ResolveHost(const char*) { return 0; }
+uint32_t NET_IpStringToUint32(const char*) { return 0; }
+void NET_IpUint32ToString(uint32_t ip, char* outIpString)
+{
+    if (outIpString == nullptr) return;
+    snprintf(outIpString, 16, "%lu.%lu.%lu.%lu",
+             (unsigned long)((ip >> 24) & 0xFF),
+             (unsigned long)((ip >> 16) & 0xFF),
+             (unsigned long)((ip >>  8) & 0xFF),
+             (unsigned long)( ip        & 0xFF));
+}
+uint32_t NET_GetIpAddress()  { return 0; }
+uint32_t NET_GetSubnetMask() { return 0; }
+
+#else // !POLYPHASE_PSP_DISABLE_NET — full networking implementation
 
 #include <pspkernel.h>
 #include <pspthreadman.h>
@@ -460,5 +513,7 @@ uint32_t NET_GetSubnetMask()
     mask.b[0] = (uint8_t)a; mask.b[1] = (uint8_t)b; mask.b[2] = (uint8_t)c; mask.b[3] = (uint8_t)d;
     return mask.u32;
 }
+
+#endif // POLYPHASE_PSP_DISABLE_NET
 
 #endif // POLYPHASE_PLATFORM_ADDON

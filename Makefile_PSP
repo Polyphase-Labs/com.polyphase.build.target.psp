@@ -255,6 +255,19 @@ DEFINES = \
     -DLOGGING_ENABLED=1 \
     $(ADDON_DEFINES)
 
+# Networking on real hardware: the PSP net stack (sceNet/sceNetInet/sceNetApctl/
+# sceNetResolver) lives in loadable PRX modules that are NOT resident when a
+# game is launched, so statically importing them makes the firmware reject the
+# EBOOT as "The data is corrupted." (PPSSPP has them always available, so a
+# net-linked build runs in the emulator but not on a device.) DISABLE_NET=1
+# compiles the PSP network layer out (see Runtime/PSP/Network_PSP.cpp) so the
+# EBOOT imports only always-resident modules. Override with `make DISABLE_NET=0`
+# to restore networking once a runtime module-load path exists.
+DISABLE_NET ?= 1
+ifeq ($(DISABLE_NET),1)
+DEFINES += -DPOLYPHASE_PSP_DISABLE_NET=1
+endif
+
 CFLAGS   = -O2 -G0 -Wall -Wno-unused-parameter -Wno-unused-variable $(DEFINES)
 CXXFLAGS = $(CFLAGS) -fno-exceptions -fno-rtti -std=c++17
 ASFLAGS  = $(CFLAGS)
@@ -342,19 +355,28 @@ $(error PSPSDK not found at '$(PSPSDK)/lib/build.mak'. Install pspdev inside WSL
   Or set PSPDEV=/path/to/your/install when invoking make.)
 endif
 
+# Build a relocatable user-mode PRX, not a static ELF. Modern PSP firmware and
+# CFW (3.xx+, ARK-4, PRO, ME) load EBOOT executables as PRX modules; a plain
+# static ELF is the legacy 1.50-kernel format and is rejected on real hardware
+# as "The data is corrupted." (PPSSPP tolerates static ELFs, which is why those
+# boot in the emulator but not on a device.) With BUILD_PRX set, build.mak runs
+# psp-prxgen + psp-fixup-imports to emit $(TARGET).prx from the linked ELF; the
+# module info / main-thread attrs already live in Runtime/PSP/Main_PSP.cpp.
+BUILD_PRX = 1
+
 include $(PSPSDK)/lib/build.mak
 
-# ---- Stage final ELF for the addon's GetCompiledBinaryPath ------------------
-# The addon's GetCompiledBinaryPath returns <projectDir>/Build/PSP/<name>.elf.
-# build.mak produces $(TARGET).elf in $(CURDIR) (which is now
+# ---- Stage the final PRX for the addon's GetCompiledBinaryPath --------------
+# The addon's GetCompiledBinaryPath returns <projectDir>/Build/PSP/<name>.prx.
+# build.mak produces $(TARGET).prx in $(CURDIR) (which is now
 # <projectDir>/Intermediate/PSP/); we copy it up two levels to the canonical
 # Build/PSP/ location so the rest of the build-target pipeline (binary mtime
-# check, copy-to-Packaged, pack-pbp wrap) finds it.
+# check, copy-to-Packaged, pack-pbp wrap / ISO EBOOT.BIN) finds it.
 all: stage
-stage: $(TARGET).elf
+stage: $(TARGET).prx
 	@mkdir -p $(PROJECT_ROOT)/Build/PSP
-	@cp $(TARGET).elf $(PROJECT_ROOT)/Build/PSP/$(TARGET).elf
-	@echo "Staged $(PROJECT_ROOT)/Build/PSP/$(TARGET).elf"
+	@cp $(TARGET).prx $(PROJECT_ROOT)/Build/PSP/$(TARGET).prx
+	@echo "Staged $(PROJECT_ROOT)/Build/PSP/$(TARGET).prx"
 
 cleanstage:
 	@rm -rf $(PROJECT_ROOT)/Build/PSP
