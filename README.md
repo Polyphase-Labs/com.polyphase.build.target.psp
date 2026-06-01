@@ -139,7 +139,7 @@ VRAM allocation in this addon (fixed at boot):
 | Engine boot + main loop | ✅ | `Main_PSP.cpp` with exit-callback wiring |
 | File I/O | ✅ | `sceIo*` |
 | Threads, mutexes, timers | ✅ | `sceKernel*` — binary semaphore for mutex |
-| Logging | ✅ | `stdout` + `ms0:/PSP/GAME/POLYPHASE/polyphase.log` |
+| Logging | ✅ | `stdout` + `ms0:/PSP/GAME/<projectName>/polyphase.log` |
 | **Textured static meshes** | ✅ | Phase 2 — 32-byte vertex, RGBA8 linear textures |
 | **Lit / shaded meshes** | ✅ | Phase 3 — `sceGuLight0..3` HW vertex lighting + `sceGuAmbient` from `World::GetAmbientLightColor` |
 | **Per-material shading** | ✅ | Phase 3 — Lit / Unlit / Toon (Toon falls back to Lit until LUT support) |
@@ -180,9 +180,77 @@ The Build Profile UI for the PSP target exposes:
 - **Firmware** — minimum PSP firmware version (default `6.60`)
 - **Custom Makefile** — override `Makefile_PSP` path if you have a fork
 - **Parallel Jobs** — `make -j<N>` (default **4**). See "Host RAM and parallel jobs" below.
-- **ICON0.PNG** / **PIC1.PNG** — XMB icon (144×80) and background (480×272)
+- **ICON0.PNG / ICON1.PMF / PIC0.PNG / PIC1.PNG / SND0.AT3** — XMB tile assets. See [PSP Game Tile Assets (XMB)](#psp-game-tile-assets-xmb).
 - **WSL Distribution** (Windows only) — defaults to `Ubuntu`
 - **PSPDEV path** — overrides auto-detect
+
+## PSP Game Tile Assets (XMB)
+
+When the PSP's XMB highlights your `EBOOT.PBP`, the firmware reads up to five
+optional tile slots to dress the tile with the title's icon, background, and
+audio. The build target wires all five through `pack-pbp` (for the memory-stick
+EBOOT) and through `PSP_GAME/` (for UMD ISO builds), so the same set of source
+files covers both shipping paths.
+
+All five are **optional** — leave a field blank to omit it; `pack-pbp` happily
+accepts empty slots.
+
+### Slot reference
+
+| Field | Filename in PBP / `PSP_GAME/` | Dimensions / format | What it does |
+| --- | --- | --- | --- |
+| **ICON0.PNG** | `ICON0.PNG` | 144×80 PNG | Static thumbnail on the XMB tile. Most projects ship at least this one. |
+| **ICON1.PMF** | `ICON1.PMF` | 144×80 PMF video | Animated tile (plays in place of ICON0 when the tile is selected). |
+| **PIC0.PNG** | `PIC0.PNG`   | 310×180 PNG | Secondary background, shown briefly before PIC1 fades in. |
+| **PIC1.PNG** | `PIC1.PNG`   | 480×272 PNG | Main background, displayed while the tile is selected. |
+| **SND0.AT3** | `SND0.AT3`   | 30-second ATRAC3 audio | Loops while the tile is highlighted. |
+
+### Pointing the build at your files
+
+Drop your tile assets anywhere inside the project — a common convention is
+`Assets/PSP/`. In **Build Profile → PSP target options**, set the matching
+field to the project-relative path. Examples:
+
+```
+ICON0.PNG (144x80)   Assets/PSP/ICON0.PNG
+ICON1.PMF (144x80)   Assets/PSP/ICON1.PMF
+PIC0.PNG  (310x180)  Assets/PSP/PIC0.PNG
+PIC1.PNG  (480x272)  Assets/PSP/PIC1.PNG
+SND0.AT3  (30s)      Assets/PSP/SND0.AT3
+```
+
+Paths are resolved through the engine's `ResolvePath` trampoline, so anything
+relative to the project root works regardless of where the editor is launched
+from.
+
+### Encoding notes
+
+- **PNGs** (ICON0, PIC0, PIC1) — 32-bit RGBA PNG works fine. Match the
+  dimensions exactly; the firmware does not rescale. Most pixel-art and image
+  editors export valid files (GIMP, Photoshop, Krita, Affinity).
+- **ICON1.PMF** — PMF is Sony's MPEG-4/H.264 container for short looping
+  video clips. The build target doesn't generate these; pre-encode with
+  `MOVIE2PMF`, `UMDGEN`, or `PMFEnc` and point the option at the resulting
+  `.pmf` file. Skip the slot if you don't have an animated icon — static
+  ICON0.PNG is what most homebrew ships with.
+- **SND0.AT3** — 30-second ATRAC3 audio loop. Encoding tooling:
+  - **Sony `at3tool`** (Windows-only, ships with the PSP SDK).
+  - **`ffmpeg`** built with the ATRAC3 codec enabled (most distro builds
+    omit it; you can usually find a `static-with-atrac3` build community
+    package or compile FFmpeg from source against the LGPL plug-in).
+  - Target bitrate: 66, 105, or 132 kbps stereo. Firmware accepts all three;
+    pick whatever your encoder is happy with.
+
+### Where the assets end up after a build
+
+| Build mode | EBOOT.PBP path | ISO path |
+| --- | --- | --- |
+| Default (EBOOT.PBP) | Embedded as pack-pbp slots inside `EBOOT.PBP` | n/a |
+| Build to ISO | n/a | Copied verbatim into `PSP_GAME/` on the UMD disc image |
+
+For the memory-stick flow the firmware reads the slots straight out of the
+PBP, so users only need to copy the staged `GAME/<projectName>/` drop-in to
+`ms0:/PSP/GAME/` — the tile assets ride along inside `EBOOT.PBP`.
 
 ## Host RAM and parallel jobs
 

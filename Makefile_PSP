@@ -245,6 +245,15 @@ OBJS  := $(CPPFILES:.cpp=.o) $(CFILES:.c=.o)
 # API_PSPGU are defined so future engine inline arms can target PSP precisely;
 # the addon-arm in fork headers (POLYPHASE_PLATFORM_ADDON) takes precedence
 # anyway by being first in every chain.
+# PSP_GAME_DIR — leaf folder under ms0:/PSP/GAME/ where the EBOOT and assets
+# live at runtime. The PSP addon's GetCompileCommand passes the project name
+# (PSP_GAME_DIR=<projectName>) so each project installs under its own folder.
+# Falls back to POLYPHASE for manual `make` invocations outside the editor.
+# Baked into the runtime via -DPOLYPHASE_PSP_GAME_DIR so System_PSP /
+# Main_PSP build the asset root and log path against the right folder. The
+# nested quoting ('"..."') is so the compiler receives the value as a C
+# string literal — gcc -D needs the double quotes to land inside the source.
+PSP_GAME_DIR ?= POLYPHASE
 DEFINES = \
     -DPOLYPHASE_PLATFORM_ADDON=1 \
     -DPLATFORM_PSP=1 \
@@ -253,6 +262,7 @@ DEFINES = \
     -DLUA_ENABLED=1 \
     -DGLM_FORCE_RADIANS \
     -DLOGGING_ENABLED=1 \
+    -DPOLYPHASE_PSP_GAME_DIR='"$(PSP_GAME_DIR)"' \
     $(ADDON_DEFINES)
 
 # Networking on real hardware: the PSP net stack (sceNet/sceNetInet/sceNetApctl/

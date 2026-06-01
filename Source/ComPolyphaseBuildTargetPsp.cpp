@@ -86,7 +86,10 @@ namespace
     constexpr const char* kDiscIdKey        = "psp.discId";         // 9-char ID e.g. "POLY00001"
     constexpr const char* kMakefileKey      = "psp.makefile";       // bare filename inside addon root, or absolute override
     constexpr const char* kIconPngKey       = "psp.icon0";          // 144x80 ICON0.PNG (relative to projectDir)
+    constexpr const char* kIcon1PmfKey      = "psp.icon1";          // 144x80 ICON1.PMF animated tile (relative to projectDir)
+    constexpr const char* kPic0PngKey       = "psp.pic0";           // 310x180 PIC0.PNG secondary background (relative to projectDir)
     constexpr const char* kBgPngKey         = "psp.pic1";           // 480x272 PIC1.PNG  (relative to projectDir)
+    constexpr const char* kSnd0At3Key       = "psp.snd0";           // 30s ATRAC3 SND0.AT3 tile audio (relative to projectDir)
     constexpr const char* kFirmwareKey      = "psp.firmware";       // e.g. "1.00", "5.00" (PSP_FW_VERSION)
     constexpr const char* kWslDistroKey     = "psp.wslDistro";      // Windows only — override default WSL distro
     constexpr const char* kPspDevPathKey    = "psp.pspdevPath";     // Path to pspdev install inside the build shell
@@ -324,6 +327,18 @@ namespace
             makePolyphasePath = " POLYPHASE_PATH=" + ShellPath(ctx->engineDir);
         }
 
+        // Pass the project name through as PSP_GAME_DIR so the runtime
+        // installs/loads under ms0:/PSP/GAME/<projectName>/ instead of the
+        // legacy hardcoded POLYPHASE folder. The Makefile turns this into
+        // -DPOLYPHASE_PSP_GAME_DIR="<projectName>" which System_PSP /
+        // Main_PSP fold into their asset-root and log-file paths.
+        std::string makePspGameDir;
+        if (ctx->projectName != nullptr && ctx->projectName[0] != '\0')
+        {
+            makePspGameDir =
+                " PSP_GAME_DIR='" + std::string(ctx->projectName) + "'";
+        }
+
         char jobsArg[16];
         std::snprintf(jobsArg, sizeof(jobsArg), " -j%d", jobs);
 
@@ -364,7 +379,7 @@ namespace
             cleanPrefix +
             "make -C " + ShellPath(intermediateDir) +
             " -f " + ShellPath(makefilePath) +
-            makeProjectRoot + makePspDev + makePolyphasePath + jobsArg;
+            makeProjectRoot + makePspDev + makePolyphasePath + makePspGameDir + jobsArg;
 
         std::snprintf(outCmd, cap, "%s", WrapShell(ctx, body).c_str());
         return 1;
@@ -576,7 +591,10 @@ namespace
                        const std::string& projectName,
                        const std::string& discId,
                        const std::string& iconPath,
+                       const std::string& icon1Path,
+                       const std::string& pic0Path,
                        const std::string& bgPath,
+                       const std::string& snd0Path,
                        const std::string& sfoPath,
                        const std::string& prxPath,
                        const std::string& isoPath,
@@ -606,8 +624,13 @@ namespace
         body += cp(sfoPath, stageDir + "/PSP_GAME/PARAM.SFO") + " && ";
         body += cp(prxPath, sysdir + "/EBOOT.BIN") + " && ";
         body += cp(prxPath, sysdir + "/BOOT.BIN") + " && ";
-        if (!iconPath.empty()) body += cp(iconPath, stageDir + "/PSP_GAME/ICON0.PNG") + " && ";
-        if (!bgPath.empty())   body += cp(bgPath,   stageDir + "/PSP_GAME/PIC1.PNG")  + " && ";
+        // XMB tile assets — all optional. Firmware reads them from PSP_GAME/
+        // on the disc (same slots the PBP gets from pack-pbp).
+        if (!iconPath.empty())  body += cp(iconPath,  stageDir + "/PSP_GAME/ICON0.PNG") + " && ";
+        if (!icon1Path.empty()) body += cp(icon1Path, stageDir + "/PSP_GAME/ICON1.PMF") + " && ";
+        if (!pic0Path.empty())  body += cp(pic0Path,  stageDir + "/PSP_GAME/PIC0.PNG")  + " && ";
+        if (!bgPath.empty())    body += cp(bgPath,    stageDir + "/PSP_GAME/PIC1.PNG")  + " && ";
+        if (!snd0Path.empty())  body += cp(snd0Path,  stageDir + "/PSP_GAME/SND0.AT3")  + " && ";
         // Minimal UMD_DATA.BIN: <DISC_ID>|<hash16>|<version>|<region>. discId is
         // constrained to alphanumerics, so a single-quoted literal is safe.
         body += "printf '%s' '" + discId + "|0000000000000000|0001|G' > " +
@@ -658,6 +681,67 @@ namespace
         std::system(cmd.c_str());
     }
 
+    // Stage a ready-to-copy <projectName>/ folder under the package's
+    // GAME/ wrapper. The user opens GAME/, drags the <projectName>/ folder
+    // onto their memory stick's PSP/GAME/ dir (which now visibly matches
+    // the wrapper name), and the EBOOT lands at the exact path System_PSP
+    // / Main_PSP look for it: ms0:/PSP/GAME/<projectName>/.
+    //
+    // Why the GAME/ wrapper: outDir already contains a <projectName>/
+    // subfolder (the engine packager's inner asset/config copy — runtime
+    // resolves it at ms0:/PSP/GAME/<projectName>/<projectName>/). A drop-in
+    // named the same thing at the sibling level would collide; nesting it
+    // under GAME/ keeps the two apart and the wrapper's name doubles as
+    // a hint to the user about where the folder belongs.
+    //
+    // The .prx and PARAM.SFO at outDir are pack-pbp's *inputs* — both are
+    // already embedded as PBP slots (DATA.PSP and the SFO header), so we
+    // skip them to keep the drop-in slim and avoid shipping the loose PRX
+    // (which would confuse end users). GAME/ itself is also excluded from
+    // the recursive copy so it doesn't try to copy into itself. Everything
+    // else at the package root is a runtime asset (Config.ini, the inner
+    // <projectName>/, Engine/CACerts/, ...) and goes in as-is.
+    //
+    // Wiped on every package so stale assets from prior runs can't survive
+    // into a fresh drop-in.
+    void StageDropInFolder(const PolyphaseBuildContext* ctx, const std::string& outDir)
+    {
+        if (ctx == nullptr || ctx->projectName == nullptr) return;
+
+        const std::string gameDir = outDir + "/GAME";
+        const std::string dropIn  = gameDir + "/" + ctx->projectName;
+        const std::string body =
+            "rm -rf " + ShellPath(gameDir) + " && " +
+            "mkdir -p " + ShellPath(dropIn) + " && " +
+            "find " + ShellPath(outDir) + " -mindepth 1 -maxdepth 1 "
+            "-not -name GAME -not -name '*.prx' -not -name PARAM.SFO "
+            "-exec cp -r {} " + ShellPath(dropIn) + "/ \\;";
+
+        const std::string cmd = WrapShell(ctx, body);
+        if (ctx->WriteOutputLine != nullptr) ctx->WriteOutputLine(cmd.c_str());
+        const int rc = std::system(cmd.c_str());
+        if (ctx->Log != nullptr)
+        {
+            char msg[512];
+            if (rc != 0)
+            {
+                std::snprintf(msg, sizeof(msg),
+                    "PSP: staging GAME/%s drop-in failed (rc=%d). EBOOT.PBP "
+                    "at the package root is still usable; copy it + the loose "
+                    "assets to ms0:/PSP/GAME/%s/ manually.",
+                    ctx->projectName, rc, ctx->projectName);
+                ctx->Log(POLYPHASE_BT_LOG_ERROR, msg);
+            }
+            else
+            {
+                std::snprintf(msg, sizeof(msg),
+                    "PSP: staged drop-in folder at %s (copy this folder into "
+                    "PSP/GAME/ on your memory stick).", dropIn.c_str());
+                ctx->Log(POLYPHASE_BT_LOG_DEBUG, msg);
+            }
+        }
+    }
+
     int32_t Psp_PostPackage(const PolyphaseBuildContext* ctx)
     {
         if (ctx == nullptr || ctx->packageOutputDir == nullptr || ctx->projectName == nullptr) return 0;
@@ -670,18 +754,24 @@ namespace
         const std::string discId   = ReadOption(ctx, kDiscIdKey,   kDiscIdDefault);
         const std::string firmware = ReadOption(ctx, kFirmwareKey, kFirmwareDefault);
 
-        // Resolve relative icon/bg paths to absolute via the engine trampoline
-        // so users can write "PSP/ICON0.PNG" in the profile without worrying
-        // about cwd.
-        std::string iconPath, bgPath;
+        // Resolve relative XMB-tile asset paths to absolute via the engine
+        // trampoline so users can write "Assets/PSP/ICON0.PNG" in the profile
+        // without worrying about cwd. All five slots are optional — pack-pbp
+        // accepts NULL for any tile the project doesn't ship.
+        std::string iconPath, icon1Path, pic0Path, bgPath, snd0Path;
         if (ctx->ResolvePath != nullptr)
         {
-            const std::string iconRel = ReadOption(ctx, kIconPngKey, "");
-            const std::string bgRel   = ReadOption(ctx, kBgPngKey,   "");
-            char abs[1024] = {0};
-            if (!iconRel.empty() && ctx->ResolvePath(iconRel.c_str(), abs, sizeof(abs))) iconPath = abs;
-            abs[0] = '\0';
-            if (!bgRel.empty()   && ctx->ResolvePath(bgRel.c_str(),   abs, sizeof(abs))) bgPath   = abs;
+            auto resolve = [&](const char* key, std::string& out) {
+                const std::string rel = ReadOption(ctx, key, "");
+                if (rel.empty()) return;
+                char abs[1024] = {0};
+                if (ctx->ResolvePath(rel.c_str(), abs, sizeof(abs))) out = abs;
+            };
+            resolve(kIconPngKey,  iconPath);
+            resolve(kIcon1PmfKey, icon1Path);
+            resolve(kPic0PngKey,  pic0Path);
+            resolve(kBgPngKey,    bgPath);
+            resolve(kSnd0At3Key,  snd0Path);
         }
 
         const std::string outDir   = ctx->packageOutputDir;
@@ -727,8 +817,11 @@ namespace
         std::string body = PspDevAutoDetectPrelude() + " && pack-pbp " +
                            ShellPath(ebootPath) + " " +
                            ShellPath(sfoPath) + " " +
-                           slotOrNull(iconPath) + " NULL NULL " +
-                           slotOrNull(bgPath) + " NULL " +
+                           slotOrNull(iconPath)  + " " +
+                           slotOrNull(icon1Path) + " " +
+                           slotOrNull(pic0Path)  + " " +
+                           slotOrNull(bgPath)    + " " +
+                           slotOrNull(snd0Path)  + " " +
                            ShellPath(prxPath) + " NULL";
 
         const std::string cmd = WrapShell(ctx, body);
@@ -756,11 +849,21 @@ namespace
             ctx->Log(POLYPHASE_BT_LOG_DEBUG, ok);
         }
 
-        // (3) Optional: repack into a bootable UMD ISO, then strip the folder
+        // (3) Stage a copy-ready GAME/<projectName>/ drop-in folder at the
+        //     package root. Skipped under ISO mode because CleanOutputExceptIso
+        //     below wipes everything except <project>.iso anyway — the drop-in
+        //     would just be deleted seconds later.
+        const bool buildToIso = ReadOption(ctx, kBuildToIsoKey, kBuildToIsoDefault) == "1";
+        if (!buildToIso)
+        {
+            StageDropInFolder(ctx, outDir);
+        }
+
+        // (4) Optional: repack into a bootable UMD ISO, then strip the folder
         //     down to just <project>.iso. Mirrors the EBOOT.PBP slot inputs —
         //     the staged .prx becomes PSP_GAME/SYSDIR/EBOOT.BIN and the assets
         //     sit alongside it in SYSDIR (see RunIsoBuilder + Runtime/PSP runtime).
-        if (ReadOption(ctx, kBuildToIsoKey, kBuildToIsoDefault) == "1")
+        if (buildToIso)
         {
             if (ctx->projectDir == nullptr)
             {
@@ -775,7 +878,8 @@ namespace
             const std::string stageDir = std::string(ctx->projectDir) + "/Intermediate/PSP/isoroot";
 
             if (!RunIsoBuilder(ctx, outDir, ctx->projectName, discId,
-                               iconPath, bgPath, sfoPath, prxPath, isoPath, stageDir))
+                               iconPath, icon1Path, pic0Path, bgPath, snd0Path,
+                               sfoPath, prxPath, isoPath, stageDir))
             {
                 return 0;
             }
@@ -969,29 +1073,41 @@ namespace
             }
         }
 
-        // ----- Icon / background -------------------------------------------
-        {
-            std::string current = ReadOption(ctx, kIconPngKey, "");
+        // ----- XMB tile assets --------------------------------------------
+        // Five optional slots the PSP's XMB shows on the EBOOT tile. Each
+        // accepts a project-relative path (typically pointing inside
+        // Assets/PSP/...). All are passed to pack-pbp and also staged into
+        // PSP_GAME/ when "Build to ISO" is enabled. See the README's "PSP
+        // Game Tile Assets (XMB)" section for dimensions and encoding
+        // tooling notes.
+        auto assetField = [&](const char* label, const char* key, const char* tooltip) {
+            std::string current = ReadOption(ctx, key, "");
             char buf[256] = {0};
             std::strncpy(buf, current.c_str(), sizeof(buf) - 1);
-            if (ImGui::InputText("ICON0.PNG (144x80)", buf, sizeof(buf)))
+            if (ImGui::InputText(label, buf, sizeof(buf)))
             {
-                ctx->SetProfileSetting(kIconPngKey, buf);
+                ctx->SetProfileSetting(key, buf);
             }
             if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Project-relative path to ICON0.PNG. Optional — pack-pbp accepts an empty slot.");
-        }
-        {
-            std::string current = ReadOption(ctx, kBgPngKey, "");
-            char buf[256] = {0};
-            std::strncpy(buf, current.c_str(), sizeof(buf) - 1);
-            if (ImGui::InputText("PIC1.PNG (480x272)", buf, sizeof(buf)))
-            {
-                ctx->SetProfileSetting(kBgPngKey, buf);
-            }
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Project-relative path to PIC1.PNG. Optional XMB background.");
-        }
+                ImGui::SetTooltip("%s", tooltip);
+        };
+        assetField("ICON0.PNG (144x80)", kIconPngKey,
+                   "Project-relative path to the static tile thumbnail (PNG, 144x80).\n"
+                   "Example: Assets/PSP/ICON0.PNG. Optional — pack-pbp accepts an empty slot.");
+        assetField("ICON1.PMF (144x80)", kIcon1PmfKey,
+                   "Project-relative path to an animated tile icon (PMF video, 144x80).\n"
+                   "PMF is Sony's MPEG-4 container — pre-encode with MOVIE2PMF or UMDGEN.\n"
+                   "Optional; ignored if empty.");
+        assetField("PIC0.PNG (310x180)", kPic0PngKey,
+                   "Project-relative path to the secondary background (PNG, 310x180).\n"
+                   "Shown briefly before PIC1 fades in. Optional.");
+        assetField("PIC1.PNG (480x272)", kBgPngKey,
+                   "Project-relative path to the main XMB background (PNG, 480x272).\n"
+                   "Displayed while the tile is selected. Optional.");
+        assetField("SND0.AT3 (30s ATRAC3)", kSnd0At3Key,
+                   "Project-relative path to a 30-second tile audio loop (ATRAC3, .at3).\n"
+                   "Pre-encode with Sony's at3tool (Windows) or an ffmpeg build with\n"
+                   "atrac3 enabled. Plays while the tile is highlighted. Optional.");
 
         // ----- Build to ISO ------------------------------------------------
         {

@@ -46,6 +46,16 @@
 
 // PSP has no <unistd.h>-style chdir; sceIo handles file paths directly.
 
+// Folder under ms0:/PSP/GAME/ that holds this build's EBOOT.PBP and assets.
+// Normally injected by Makefile_PSP from the editor's PSP_GAME_DIR=<project>
+// make-line variable (which itself comes from ctx->projectName), so each
+// project installs to its own slot. The literal POLYPHASE fallback only
+// fires if someone runs `make -f Makefile_PSP` by hand without passing
+// PSP_GAME_DIR — kept so manual builds still produce something workable.
+#ifndef POLYPHASE_PSP_GAME_DIR
+#define POLYPHASE_PSP_GAME_DIR "POLYPHASE"
+#endif
+
 // Static state — minimal. The engine's EngineState owns most lifecycle data;
 // this layer only needs a few flags and the dir-iteration thunk state.
 static bool sInitialized = false;
@@ -97,14 +107,15 @@ std::string SYS_GetExecutablePath()
     // PSP has no concept of "executable path" beyond the EBOOT.PBP location.
     // The official launcher passes the path as argv[0] to main; we don't have
     // access here. Return the conventional XMB location.
-    return "ms0:/PSP/GAME/POLYPHASE/EBOOT.PBP";
+    return "ms0:/PSP/GAME/" POLYPHASE_PSP_GAME_DIR "/EBOOT.PBP";
 }
 
 std::string SYS_GetPolyphasePath()
 {
     // Resolve the asset root once and cache it. Two packaging layouts:
     //   - EBOOT.PBP on a memory stick: assets sit alongside the EBOOT under
-    //     ms0:/PSP/GAME/POLYPHASE/ (the historical layout).
+    //     ms0:/PSP/GAME/<PSP_GAME_DIR>/ (the historical layout — folder name
+    //     is the project name, set by the editor at compile time).
     //   - Bootable UMD ISO ("Build to ISO"): the executable lives at
     //     disc0:/PSP_GAME/SYSDIR/EBOOT.BIN and the assets are at the disc root,
     //     so when that file exists we resolve assets against disc0:/.
@@ -120,7 +131,7 @@ std::string SYS_GetPolyphasePath()
         if (sceIoGetstat("disc0:/PSP_GAME/SYSDIR/EBOOT.BIN", &st) >= 0)
             sBase = "disc0:/PSP_GAME/SYSDIR/";
         else
-            sBase = "ms0:/PSP/GAME/POLYPHASE/";
+            sBase = "ms0:/PSP/GAME/" POLYPHASE_PSP_GAME_DIR "/";
     }
     return sBase;
 }
@@ -133,7 +144,7 @@ std::string SYS_GetCurrentDirectoryPath()
         // PSP supports relative paths against the EBOOT dir; just return ".".
         return "./";
     }
-    return "ms0:/PSP/GAME/POLYPHASE/";
+    return "ms0:/PSP/GAME/" POLYPHASE_PSP_GAME_DIR "/";
 }
 
 std::string SYS_GetAbsolutePath(const std::string& relativePath)
@@ -615,7 +626,7 @@ std::string SYS_GetClipboardText() { return ""; }
 // =========================================================================
 
 // File-backed log path. On PPSSPP this lands under the memstick directory
-// (typically `<User>/Documents/PPSSPP/memstick/PSP/GAME/POLYPHASE/polyphase.log`
+// (typically `<User>/Documents/PPSSPP/memstick/PSP/GAME/<PSP_GAME_DIR>/polyphase.log`
 // on Windows hosts) — readable from the host filesystem while the game runs.
 // On real PSP hardware it lives on the physical memory stick, same path.
 //
@@ -623,7 +634,7 @@ std::string SYS_GetClipboardText() { return ""; }
 // don't survive across thread context switches well, and Polyphase's
 // LogDebug calls happen from many threads (asset loader, audio, main).
 // Per-call open/append/close is slower but bulletproof.
-static const char* sLogFilePath = "ms0:/PSP/GAME/POLYPHASE/polyphase.log";
+static const char* sLogFilePath = "ms0:/PSP/GAME/" POLYPHASE_PSP_GAME_DIR "/polyphase.log";
 
 // Ensure the dir tree leading to sLogFilePath exists. sceIoMkdir is single-
 // level only, so we walk the path and call it once per segment. EEXIST is
@@ -635,7 +646,7 @@ static void Psp_EnsureLogDir()
 {
     sceIoMkdir("ms0:/PSP", 0777);
     sceIoMkdir("ms0:/PSP/GAME", 0777);
-    sceIoMkdir("ms0:/PSP/GAME/POLYPHASE", 0777);
+    sceIoMkdir("ms0:/PSP/GAME/" POLYPHASE_PSP_GAME_DIR, 0777);
 }
 
 void Psp_AppendLogLineRaw(const char* line)
