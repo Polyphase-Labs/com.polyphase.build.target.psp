@@ -279,24 +279,31 @@ void SYS_CloseDirectory(DirEntry& dirEntry)
     dirEntry.mValid = false;
 }
 
-void SYS_CopyFile(const char* sourcePath, const char* destPath)
+// Returns true if the file was fully copied. Matches the engine's SYS_CopyFile
+// contract (System.h) so packaging can detect a failed copy instead of silently
+// shipping a broken build.
+bool SYS_CopyFile(const char* sourcePath, const char* destPath)
 {
-    if (sourcePath == nullptr || destPath == nullptr) return;
+    if (sourcePath == nullptr || destPath == nullptr) return false;
 
     const SceUID src = sceIoOpen(sourcePath, PSP_O_RDONLY, 0);
-    if (src < 0) return;
+    if (src < 0) return false;
 
     const SceUID dst = sceIoOpen(destPath, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
-    if (dst < 0) { sceIoClose(src); return; }
+    if (dst < 0) { sceIoClose(src); return false; }
 
+    bool copyOk = true;
     char buf[4096];
     int read = 0;
     while ((read = sceIoRead(src, buf, sizeof(buf))) > 0)
     {
-        if (sceIoWrite(dst, buf, read) < 0) break;
+        if (sceIoWrite(dst, buf, read) != read) { copyOk = false; break; }
     }
+    if (read < 0) copyOk = false;   // read error mid-copy
+
     sceIoClose(src);
     sceIoClose(dst);
+    return copyOk;
 }
 
 void SYS_CopyDirectory(const char* /*sourceDir*/, const char* /*destDir*/) {}

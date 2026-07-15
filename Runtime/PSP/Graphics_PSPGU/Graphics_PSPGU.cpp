@@ -39,6 +39,7 @@
 #include "Engine/Assets/Texture.h"
 #include "Engine/Assets/Font.h"
 #include "Engine/Nodes/3D/StaticMesh3d.h"
+#include "Engine/Nodes/3D/ShadowMesh3d.h"
 #include "Engine/Nodes/3D/SkeletalMesh3d.h"
 #include "Engine/Nodes/3D/InstancedMesh3d.h"
 #include "Engine/Nodes/3D/Particle3d.h"
@@ -168,15 +169,16 @@ namespace
         World* world = renderer ? renderer->GetCurrentWorld() : nullptr;
         if (world == nullptr) return;
 
-        // Vulkan/3DS use a shader-side `out *= u_color_scale` (default 2.0)
-        // that doubles the final fragment to compensate for the engine's
-        // vertex-color pre-divide. PSP fixed-function has no shader, so the
-        // output is dim by the same factor. Pre-multiply ambient + light
-        // intensities by the scale here; PackColorAbgr clamps to [0,1] so
-        // bright lights saturate instead of overflowing.
+        // colorScale (default 2.0) restores vertex colours the engine pre-divides
+        // by 2. GX applies it as a FINAL output multiply, computing lighting at
+        // half-brightness first so nothing saturates. PSP fixed-function has no
+        // final output-scale stage, so ambient must be used AS-IS: pre-multiplying
+        // it by colorScale pushes a normal ambient (e.g. 0.63 -> 1.26) past 1.0,
+        // saturating every surface to full white and flattening ALL directional
+        // shading. The (scaled) light below then provides the gradient on top.
         const float colorScale = renderer->GetColorScale();
 
-        const glm::vec4 ambient = world->GetAmbientLightColor() * colorScale;
+        const glm::vec4 ambient = world->GetAmbientLightColor();
         sceGuAmbient(PackColorAbgr(ambient, 1.0f));
 
         const std::vector<LightData>& lights = renderer->GetLightData();
@@ -871,7 +873,25 @@ glm::mat4 GFX_MakeOrthographicMatrix(float left, float right, float bottom, floa
     return glm::ortho(left, right, bottom, top, zNear, zFar);
 }
 
-void GFX_SetFog(const FogSettings& /*fogSettings*/) {}
+void GFX_SetFog(const FogSettings& fogSettings)
+{
+    if (!sGuInitialised) return;
+
+    if (fogSettings.mEnabled)
+    {
+        // PSP GE fog is linear distance (eye-space Z) fog: clear at 'near', fully
+        // fogged at 'far'. There is no hardware exponential mode, so Exponential
+        // falls back to the same linear ramp. Called once per frame from the
+        // engine's BeginFrame; the UI pipeline disables GU_FOG so 2D isn't fogged.
+        const uint32_t color = PackColorAbgr(fogSettings.mColor, 1.0f);
+        sceGuFog(fogSettings.mNear, fogSettings.mFar, color);
+        sceGuEnable(GU_FOG);
+    }
+    else
+    {
+        sceGuDisable(GU_FOG);
+    }
+}
 void GFX_DrawLines(const std::vector<Line>& /*lines*/) {}
 void GFX_DrawFullscreen() {}
 void GFX_ResizeWindow() {}
@@ -1389,7 +1409,55 @@ bool GFX_IsCpuSkinningRequired(SkeletalMesh3D* /*c*/)
     return true;
 }
 
-void GFX_DrawShadowMeshComp(ShadowMesh3D* /*c*/) {}
+// Simple "blob" shadow: draw the shadow mesh as a flat, unlit, translucent quad
+// tinted by the world shadow colour. GX uses a 3-pass alpha-buffer trick to avoid
+// double-blending overlapping shadow triangles; PSP draws a single translucent pass,
+// which is fine for the flat disc/quad blob meshes used under characters.
+void GFX_DrawShadowMeshComp(ShadowMesh3D* c)
+{
+    if (!sGuInitialised || c == nullptr) return;
+
+    StaticMesh* mesh = c->GetStaticMesh();
+    if (mesh == nullptr) return;
+
+    StaticMeshResource* r = mesh->GetResource();
+    if (r == nullptr || r->mVertexData == nullptr || r->mIndexData == nullptr) return;
+    if (r->mNumIndices == 0) return;
+
+    World* world = Renderer::Get() ? Renderer::Get()->GetCurrentWorld() : nullptr;
+    const glm::vec4 shadowColor = world ? world->GetShadowColor()
+                                        : glm::vec4(0.0f, 0.0f, 0.0f, 0.5f);
+
+    // Untextured (white 1x1 MODULATE lets sceGuColor through), unlit, flat colour.
+    BindTexture(nullptr);
+    sceGuDisable(GU_LIGHTING);
+    sceGuColor(PackColorAbgr(shadowColor, shadowColor.a));
+
+    // Translucent so it darkens the floor; depth-tested against the scene but no
+    // depth writes (a shadow must not occlude anything). Cull disabled so the flat
+    // shadow quad shows regardless of its winding relative to the camera.
+    sceGuEnable(GU_BLEND);
+    sceGuBlendFunc(GU_ADD, GU_SRC_ALPHA, GU_ONE_MINUS_SRC_ALPHA, 0, 0);
+    sceGuDisable(GU_ALPHA_TEST);
+    sceGuDisable(GU_CULL_FACE);
+    sceGuEnable(GU_DEPTH_TEST);
+    sceGuDepthFunc(GU_GEQUAL);  // PSP inverted depth (far = 0)
+    sceGuDepthMask(GU_TRUE);    // GU_TRUE = depth writes masked OFF
+
+    ScePspFMatrix4 worldMtx;
+    const glm::mat4& worldXform = c->GetRenderTransform();
+    memcpy(&worldMtx, &worldXform[0][0], sizeof(float) * 16);
+    sceGuSetMatrix(GU_MODEL, &worldMtx);
+
+    sceGuDrawArray(GU_TRIANGLES,
+                   r->mVertexFlags,
+                   (int)r->mNumIndices,
+                   r->mIndexData,
+                   r->mVertexData);
+
+    // Re-enable depth writes for subsequent opaque draws.
+    sceGuDepthMask(GU_FALSE);
+}
 
 // PSP has no HW instancing — fixed-function GE has no per-instance vertex
 // attribute mechanism, no SSBO, no shader to read a transform array from. So
