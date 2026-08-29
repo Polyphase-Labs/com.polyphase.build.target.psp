@@ -96,6 +96,10 @@ namespace
     constexpr const char* kJobsKey          = "psp.jobs";           // make -j parallelism (default 4; engine TUs are 1-2 GB/TU peak)
     constexpr const char* kBuildToIsoKey    = "psp.buildToIso";     // "1" = pack a bootable UMD ISO and leave only <project>.iso
 
+    // Engine-owned option (POLYPHASE_OPT_HIDE_CONTENT_PAK in BuildProfile.h,
+    // which we don't include — the addon links the plugin API headers only).
+    constexpr const char* kHideContentPakKey = "polyphase.hideContentPak";
+
     constexpr const char* kTitleDefault     = "Polyphase Game";
     constexpr const char* kDiscIdDefault    = "POLY00001";
     constexpr const char* kMakefileDefault  = "Makefile_PSP";
@@ -959,6 +963,24 @@ namespace
     void Psp_DrawProfileOptions(const PolyphaseBuildContext* ctx)
     {
         if (ctx == nullptr || ctx->SetProfileSetting == nullptr) return;
+
+        // PSPGU compiles its shaders in, so an Embedded build is already a
+        // single deliverable and a Content Pak beside it would carry nothing
+        // (the only thing embedding misses is the Vulkan .spv files, which we
+        // never ship). Opt out of the checkbox. basePlatform can't tell the
+        // engine this — Linux there is a cook-compat anchor, not a backend.
+        //
+        // Written only when unset, so a deliberate "0" isn't fought over.
+        // ReadOption() can't be used: it collapses unset and empty into the
+        // fallback string.
+        if (ctx->GetProfileSetting != nullptr)
+        {
+            char pakBuf[8] = {0};
+            if (ctx->GetProfileSetting(kHideContentPakKey, pakBuf, sizeof(pakBuf)) == 0)
+            {
+                ctx->SetProfileSetting(kHideContentPakKey, "1");
+            }
+        }
 
         // ----- Title (XMB display name) ------------------------------------
         {
