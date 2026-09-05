@@ -308,9 +308,10 @@ bool SYS_CopyFile(const char* sourcePath, const char* destPath)
 
 void SYS_CopyDirectory(const char* /*sourceDir*/, const char* /*destDir*/) {}
 bool SYS_CopyDirectoryRecursive(const std::string& /*sourceDir*/, const std::string& /*destDir*/) { return false; }
-void SYS_MoveDirectory(const char* sourceDir, const char* destDir)
+bool SYS_MoveDirectory(const char* sourceDir, const char* destDir)
 {
-    if (sourceDir && destDir) sceIoRename(sourceDir, destDir);
+    if (sourceDir == nullptr || destDir == nullptr) return false;
+    return sceIoRename(sourceDir, destDir) >= 0;
 }
 void SYS_MoveFile(const char* sourcePath, const char* destPath)
 {

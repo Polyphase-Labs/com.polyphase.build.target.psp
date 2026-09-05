@@ -278,9 +278,22 @@ ifeq ($(DISABLE_NET),1)
 DEFINES += -DPOLYPHASE_PSP_DISABLE_NET=1
 endif
 
-CFLAGS   = -O2 -G0 -Wall -Wno-unused-parameter -Wno-unused-variable $(DEFINES)
+# -MMD -MP: emit a <obj>.d header-dependency file next to every object and
+# pull them all back in below. Without this, make only compares each .o
+# against its own .cpp, so editing an engine header (a struct gaining a
+# field, a function gaining a defaulted parameter) leaves every other TU
+# stale. Symptoms range from "undefined reference to <old signature>" at
+# link time to objects that link fine but read a struct with the wrong
+# layout at runtime. -MP adds phony targets for each header so a deleted
+# header doesn't break the next build.
+DEPFLAGS = -MMD -MP
+CFLAGS   = -O2 -G0 -Wall -Wno-unused-parameter -Wno-unused-variable $(DEFINES) $(DEPFLAGS)
 CXXFLAGS = $(CFLAGS) -fno-exceptions -fno-rtti -std=c++17
 ASFLAGS  = $(CFLAGS)
+
+# Remove the .d files on `make clean` alongside the objects (build.mak's
+# clean target only knows about $(OBJS) and $(EXTRA_CLEAN)).
+EXTRA_CLEAN += $(OBJS:.o=.d)
 
 # ---- Libraries --------------------------------------------------------------
 # PSPSDK ships everything the engine needs except Lua (we compile our own
@@ -375,6 +388,10 @@ endif
 BUILD_PRX = 1
 
 include $(PSPSDK)/lib/build.mak
+
+# Header dependencies written by -MMD (see DEPFLAGS). `-include` is non-fatal
+# so the very first build, before any .d exists, still works.
+-include $(OBJS:.o=.d)
 
 # ---- Stage the final PRX for the addon's GetCompiledBinaryPath --------------
 # The addon's GetCompiledBinaryPath returns <projectDir>/Build/PSP/<name>.prx.
