@@ -203,7 +203,7 @@ namespace
             }
             else
             {
-                psptype     = GU_POINTLIGHT;
+                psptype     = (ld.mType == LightType::Spot) ? GU_SPOTLIGHT : GU_POINTLIGHT;
                 posOrDir.x  = ld.mPosition.x;
                 posOrDir.y  = ld.mPosition.y;
                 posOrDir.z  = ld.mPosition.z;
@@ -211,11 +211,29 @@ namespace
 
             sceGuLight(i, psptype, GU_DIFFUSE_AND_SPECULAR, &posOrDir);
 
+            if (ld.mType == LightType::Spot)
+            {
+                // GE spot direction points along the beam (GL convention); cutoff
+                // register takes the cosine of the outer half-angle. Exponent is
+                // picked so intensity reaches ~50% at the inner half-angle.
+                ScePspFVector3 spotDir;
+                spotDir.x = ld.mDirection.x;
+                spotDir.y = ld.mDirection.y;
+                spotDir.z = ld.mDirection.z;
+
+                float cosOuter = cosf(glm::radians(glm::clamp(ld.mOuterConeAngle, 0.1f, 89.9f)));
+                float cosInner = cosf(glm::radians(glm::clamp(ld.mInnerConeAngle, 0.0f, 89.0f)));
+                cosInner = std::min(cosInner, 0.9999f);
+                float exponent = glm::clamp(logf(0.5f) / logf(cosInner), 0.0f, 128.0f);
+
+                sceGuLightSpot(i, &spotDir, exponent, cosOuter);
+            }
+
             const glm::vec4 lightCol = ld.mColor * ld.mIntensity * colorScale;
             sceGuLightColor(i, GU_DIFFUSE,  PackColorAbgr(lightCol, 1.0f));
             sceGuLightColor(i, GU_SPECULAR, PackColorAbgr(lightCol, 1.0f));
 
-            if (ld.mType == LightType::Point && ld.mRadius > 0.0f)
+            if ((ld.mType == LightType::Point || ld.mType == LightType::Spot) && ld.mRadius > 0.0f)
             {
                 // Map radius → attenuation. PSP att model is
                 // 1 / (const + linear*d + quadratic*d^2). Match the engine's
